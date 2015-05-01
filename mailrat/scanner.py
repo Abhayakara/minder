@@ -4,32 +4,52 @@ import mailbox
 import email
 import email.parser
 import email.utils
+import email.header
 import operator
 import re
 import os
 import sys
 import copy
+import codecs
 
 ksantiRL = re.compile(r"from toccata.fugue.com.*by.*ksanti", flags = re.DOTALL + re.MULTILINE)
 toccataRL1 = re.compile(r"\s*by.*toccata.fugue.com", flags = re.DOTALL)
 toccataRL2 = re.compile(r".*; (.*)$", flags = re.DOTALL)
 
+class messageObject:
+  def __init__(self, key=None, timestamp=None, message=None):
+    self.key = key
+    self.timestamp = timestamp
+    self.message = message
+
+class aVersion:
+  def __init__(self, version_id=None, timestamp=None, machines=None, messages=None):
+    self.version_id = version_id
+    self.timestemp = timestamp
+    self.machines = machines
+    self.curmsgs = curmsgs
+    
 class headerMessageFactory(mailbox.MaildirMessage):
   def __init__(self, file):
     parser = email.parser.BytesParser()
     message = parser.parse(file, headersonly=True)
     return super().__init__(message)
 
-messages = {}
+messages = None
+msgSet = set()
+mailboxes = {}
+topics = {}
 
-if not os.path.isdir("~/minder"):
-  os.mkdir("~/minder", 0700)
-if not os.path.isdir("~/minder/mailrat"):
-  os.mkdir("~/minder/mailrat", 0700)
-if not os.path.isdir("~/minder/mailrat/topics"):
-  os.mkdir("~/minder/mailrat/topics", 0700)
-for topic_name in os.listdir("~/minder/mailrat/topics"):
-  f = open("~/minder/mailrat/topics/" + topic_name, "r")
+home = os.environ["HOME"]
+
+if not os.path.isdir(home + "/minder"):
+  os.mkdir(home + "/minder", 0o700)
+if not os.path.isdir(home + "/minder/mailrat"):
+  os.mkdir(home + "/minder/mailrat", 0o700)
+if not os.path.isdir(home + "/minder/mailrat/topics"):
+  os.mkdir(home + "/minder/mailrat/topics", 0o700)
+for topic_name in os.listdir(home + "/minder/mailrat/topics"):
+  f = open(home + "/minder/mailrat/topics/" + topic_name, "r")
   
   # lines are either the beginning of a version, or else an add, or else a delete
   # The first line in a file is always the beginning of a version.   Each such
@@ -47,6 +67,7 @@ for topic_name in os.listdir("~/minder/mailrat/topics"):
   versions = []
   curmsgs = None
   curver = None
+  everything = False
 
   for line in f:
     # Get rid of the trailing newline and any trailing whitespace, which shouldn't
@@ -65,28 +86,36 @@ for topic_name in os.listdir("~/minder/mailrat/topics"):
       machines = chunks[3:]
       verid = chunks[1]
       if curver != None:
+        if everything:
+          messages = copy.copy(curmsgs)
+          everything = False
         # if we added messages to a copy of a previous version, they may
         # be out of order, so re-sort the list in place before copying it.
-        curmsgs.sort(lambda foo: foo[1])
+        else:
+          curmsgs.sort(lambda foo: foo.timestamp)
         curmsgs = copy.copy(curmsgs)
         versions.append(curver)
       else:
+        if topic == 'all':
+          everything = True
         curmsgs = []
-      curver = (verid, timestamp, machines, curmsgs)
-    else if line[0] == '+':
+      curver = aVersion(version_id=verid, timestamp=timestamp, machines=machines, messages=curmsgs)
+    elif line[0] == '+':
       chunks = line.split(' ')
       if len(chunks) != 2:
         raise Exception("malformed add line in ~/minder/mailrat/topics/" + topic_name + " at line " + str(lineno))
       msgid = chunks[0][1:]
       timestamp = int(chunks[1])
-      curmsg = (msgid, timestamp)
+      curmsg = messageObject(key=msgid, timestamp=timestamp)
       curmsgs.append(curmsg)
       count = count - 1
-    else if line[0] == '-':
+      if everything:
+        msgSet.add(msgid)
+    elif line[0] == '-':
       msgid = line[1:]
       found = None
       for i in range(0, len(curmsgs)):
-        if curmsgs[i][0] == msgid:
+        if curmsgs[i].key == msgid:
           curmsgs.pop(i)
           break
       else:
@@ -94,56 +123,110 @@ for topic_name in os.listdir("~/minder/mailrat/topics"):
     else:
       raise Exception("malformed message id line in ~/minder/mailrat/topics/" + topic_name + " at line " + str(lineno))
   if curver != None:
+    if everything:
+      messages = copy.copy(curmsgs)
+      everything = False
     versions.append(curver)
   if len(versions) > 0:
     topics['topic'] = versions
   f.close()
       
+if messages == None:
+  messages = []
 maildir = mailbox.Maildir("~/mail", factory=headerMessageFactory, create=False)
 keys = maildir.keys()
-messages = []
 for key in keys:
-  message = maildir.get(key)
-  msgDate = None
-  try:
-    msgDate = email.utils.parsedate_to_datetime(message.get("Date"));
-  except Exception as e:
-    pass
-  if msgDate == None:
+  if key not in msgSet:
+    message = maildir.get(key)
+    msgDate = None
     try:
-      rcvds = message.get_all("Received")
+      msgDate = email.utils.parsedate_to_datetime(message.get("Date"));
+    except Exception as e:
+      pass
+    if msgDate == None:
       try:
-        if ksantiRL.match(rcvds[0]):
-          tocoff = 1
-        else:
-          tocoff = 0
-        tocLines = rcvds[tocoff].split('\n')
-        match = toccataRL1.match(tocLines[1])
-        if match:
-          match = toccataRL2.match(tocLines[2])
+        rcvds = message.get_all("Received")
+        try:
+          if ksantiRL.match(rcvds[0]):
+            tocoff = 1
+          else:
+            tocoff = 0
+          tocLines = rcvds[tocoff].split('\n')
+          match = toccataRL1.match(tocLines[1])
           if match:
-            msgDate = email.utils.parsedate_to_datetime(match.group(1))
+            match = toccataRL2.match(tocLines[2])
+            if match:
+              msgDate = email.utils.parsedate_to_datetime(match.group(1))
+        except Exception as f:
+          pass
       except Exception as f:
+          pass
+    if msgDate == None:
+      try:
+        print("From: " + message.get("From") + " :: " + str(e))
+      except Exception as f:
+        print("key0: " + key + ": " + str(e))
+    else:
+      msgObj = messageObject(key=key, timestamp=msgDate.timestamp(), message=message)
+      messages.append(msgObj)
+      msgSet.add(key)
+      # Make a topic or add this message to a topic based on the IMAP mailbox name
+      catHeaderChunks = []
+      try:
+        catHeaderChunks = email.header.decode_header(message.get("X-getmail-retrieved-from-mailbox"))
+      except Exception as e:
         pass
-    except Exception as f:
-        pass
-  if msgDate == None:
-    try:
-      print("From: " + message.get("From") + " :: " + str(e))
-    except Exception as f:
-      print("key0: " + key + ": " + str(e))
-  else:
-    messages.append((msgDate.timestamp(), message))
+      else:
+        mailbox = ""
+        for chunk in catHeaderChunks:
+          mailbox = mailbox + codecs.decode(chunk[0], chunk[1])
+        if mailbox not in mailboxes:
+          if mailbox in topics:
+            mailboxes[mailbox] = copy.copy(topics[category][0].messages)
+          else:
+            mailboxes[mailbox] = []
+        mailbox = mailboxes[mailbox]
+        mailbox.append(msgObj)
 
-print(repr(messages[0]))
-messages = sorted(messages, key=lambda foo: foo[0])
-for i in range(len(messages) - 10, len(messages)):
-  print("From: " + messages[i][1].get("From"))
-  if messages[i][1].__contains__("To"):
-    print("To: " + messages[i][1].get("To"))
+# Sort the new message list and add a version to the "all" set.
+# Note that if there is an IMAP maibox called "all", this obliterates
+# it.   Tough luck.   Those messages are still the in "all" topic.   :)
+messages.sort(key=lambda foo: foo.timestamp)
+mailboxes['all'] = messages
+
+for mailbox in mailboxes.keys():
+  print(mailbox + ": " + str(len(mailboxes[mailbox])))
+  mailboxes[mailbox].sort(key=lambda foo: foo.timestamp
+  newversion = aVersion(timestamp=time.time(), messages=mailboxes[mailbox])
+  if mailbox in topics:
+    topics[mailbox] = [newversion] + topics[mailbox]
   else:
-    print("To: <not specified>")
-  print("Subject: " + messages[i][1].get("Subject"))
-  print("Date: " + email.utils.formatdate(timeval = messages[i][0]))
-  print("")
+    topics[mailbox] = [newversion]
+
+# Now write out all the topics.
+for key, topic in topics.items():
+  prev = []
+  for version in topic:
+    msgs = version.messages
+    count = 0
+    old = 0
+    cur = 0
+    output = []
+    # to diff two lists of messages, we make the following critical assumptions:
+    #  1. the message arrival time for a particular key is the same
+    #  2. the lists are sorted according to message arrival time
+    # practically speaking, if a message key appears twice with different
+    # arrival times, the list will contain that key twice.   It may be
+    # that we should have special code that detects this when combing
+    # the lists, but the easiest way to detect it is when adding.
+    # XXX think about this
+    while old < len(prev) or cur < len(msgs):
+      if old < len(prev) and cur < len(msgs):
+        # I'm thinking the right way to deal with duplicate keys with different
+        # timestamps is to make a list sorted by keys and search for duplicates
+        # after creating the list, either by reading it from a file or by
+        # scanning the messages.
+        if (prev[old].key == cur[old].key and
+            prev[old].timestamp == cur[old].timestamp):
+      
 exit(0)
