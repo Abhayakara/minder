@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 
 import mailbox
 import email
@@ -196,7 +196,7 @@ mailboxes['all'] = messages
 
 for mailbox in mailboxes.keys():
   print(mailbox + ": " + str(len(mailboxes[mailbox])))
-  mailboxes[mailbox].sort(key=lambda foo: foo.timestamp
+  mailboxes[mailbox].sort(key=lambda foo: foo.timestamp)
   newversion = aVersion(timestamp=time.time(), messages=mailboxes[mailbox])
   if mailbox in topics:
     topics[mailbox] = [newversion] + topics[mailbox]
@@ -208,7 +208,6 @@ for key, topic in topics.items():
   prev = []
   for version in topic:
     msgs = version.messages
-    count = 0
     old = 0
     cur = 0
     output = []
@@ -225,8 +224,29 @@ for key, topic in topics.items():
         # I'm thinking the right way to deal with duplicate keys with different
         # timestamps is to make a list sorted by keys and search for duplicates
         # after creating the list, either by reading it from a file or by
-        # scanning the messages.
+        # scanning the messages.   For now we treat messages with different key
+        # but identical timestamp as if they are different messages.
         if (prev[old].key == cur[old].key and
             prev[old].timestamp == cur[old].timestamp):
-      
+          old = old + 1
+          new = new + 1
+        # If the timestamp in prev is greater than in cur,
+        # it means that the item in prev isn't present in
+        # cur.
+        elif prev[old].timestamp > cur[old].timestamp:
+          output.append("-" + prev[old].key)
+          old = old + 1
+        # Otherwise this item was present in cur but not in prev
+        else:
+          output.append("+" + cur[new].key + " " + str(cur[new].timestamp))
+          new = new + 1
+      # We have exhausted the contents of the previous version, so this
+      # must be an entry that exists only in the current version
+      elif old == len(prev):
+        output.append("+" + cur[new].key + " " + str(cur[new].timestamp))
+        new = new + 1
+      else:
+        output.append("-" + prev[old].key)
+    topfile.write(
+
 exit(0)
