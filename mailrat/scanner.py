@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import mailbox
 import email
@@ -14,7 +14,7 @@ import codecs
 import time
 import datetime
 import string
-import urllib
+import urllib.parse
 
 ksantiRL = re.compile(r"from toccata.fugue.com.*by.*ksanti", flags = re.DOTALL + re.MULTILINE)
 toccataRL1 = re.compile(r"\s*by.*toccata.fugue.com", flags = re.DOTALL)
@@ -25,7 +25,46 @@ class messageObject:
     self.key = key
     self.timestamp = timestamp
     self.message = message
-
+  def __lt__(self, other):
+    if int(self.timestamp) == int(other.timestamp):
+      if self.key < other.key:
+        return True
+    elif int(self.timestamp) < int(other.timestamp):
+      return True
+    return False
+  def __gt__(self, other):
+    if self.timestamp == other.timestamp:
+      if self.key > other.key:
+        return True
+    elif self.timestamp > other.timestamp:
+      return True
+    return False
+  def __eq__(self, other):
+    if self.timestamp == other.timestamp:
+      if self.key == other.key:
+        return True
+    return False
+  def __le__(self, other):
+    if self.timestamp == other.timestamp:
+      if self.key <= other.key:
+        return True
+    elif self.timestamp <= other.timestamp:
+      return True
+    return False
+  def __ge__(self, other):
+    if self.timestamp == other.timestamp:
+      if self.key >= other.key:
+        return True
+    elif self.timestamp >= other.timestamp:
+      return True
+    return False
+  def __ne__(self, other):
+    if self.timestamp != other.timestamp:
+      return True
+    elif self.key != other.key:
+        return True
+    return False
+  
 class aVersion:
   def __init__(self, version_id=None, timestamp=None, machines=[], messages=None):
     self.version_id = version_id
@@ -76,7 +115,7 @@ def skip_old_versions(files):
   return ret
 
 messages = None
-msgSet = set()
+msgSet = {}
 mailboxes = {}
 topics = {}
 
@@ -118,7 +157,9 @@ for topic_name in skip_old_versions(os.listdir(topicsDir)):
     # be there anyway.
     line = line.rstrip()
     lineno = lineno + 1
-    if count == 0:
+    if line[0] == '#':
+      pass
+    elif count == 0:
       # Parse chunk-count version-id timestamp [machines...]
       chunks = line.split(' ')
       if len(chunks) < 3:
@@ -131,12 +172,13 @@ for topic_name in skip_old_versions(os.listdir(topicsDir)):
       verid = chunks[1]
       if curver != None:
         if everything:
+          curmsgs.sort()
           messages = copy.copy(curmsgs)
           everything = False
         # if we added messages to a copy of a previous version, they may
         # be out of order, so re-sort the list in place before copying it.
         else:
-          curmsgs.sort(key=lambda foo: foo.timestamp)
+          curmsgs.sort()
         curmsgs = copy.copy(curmsgs)
         versions.append(curver)
       else:
@@ -153,8 +195,8 @@ for topic_name in skip_old_versions(os.listdir(topicsDir)):
       curmsg = messageObject(key=msgid, timestamp=timestamp)
       curmsgs.append(curmsg)
       count = count - 1
-      if everything:
-        msgSet.add(msgid)
+      if everything and msgid not in msgSet:
+        msgSet[msgid] = curmsg
     elif line[0] == '-':
       msgid = line[1:]
       found = None
@@ -168,6 +210,7 @@ for topic_name in skip_old_versions(os.listdir(topicsDir)):
     else:
       raise Exception("malformed message id line in " + topicsDir + "/" + topic_name + " at line " + str(lineno) + "at count " + str(count))
   if curver != None:
+    curmsgs.sort()
     if everything:
       messages = copy.copy(curmsgs)
       everything = False
@@ -184,8 +227,11 @@ else:
   maildirName = home + "/mail"
 maildir = mailbox.Maildir(maildirName, factory=headerMessageFactory, create=False)
 keys = maildir.keys()
+allNow = []
 for key in keys:
-  if key not in msgSet:
+  if key in msgSet:
+    allNow.append(msgSet[key])
+  else:
     msgDate = None
     e = None
     message = maildir.get(key)
@@ -193,28 +239,24 @@ for key in keys:
     # not necessarily trustworthy, particularly for spam, and can result in unread
     # mail showing up out of order in the mailbox when mail arrives in a different
     # order than the datestamps placed on the mail by the sender.
-    try:
-      rcvds = message.get_all("Received")
-      try:
-        if ksantiRL.match(rcvds[0]):
-          tocoff = 1
-        else:
-          tocoff = 0
+    rcvds = message.get_all("Received")
+    if rcvds != None:
+      if ksantiRL.match(rcvds[0]):
+        tocoff = 1
+      else:
+        tocoff = 0
+      if tocoff < len(rcvds):
         tocLines = rcvds[tocoff].split('\n')
         match = toccataRL1.match(tocLines[1])
         if match:
           match = toccataRL2.match(tocLines[2])
-          if match:
-            msgDate = parse_message_date(match.group(1))
-      except Exception as f:
-        e = f
-    except Exception as f:
-        e = f
+        if match:
+          msgDate = parse_message_date(match.group(1))
     if msgDate == None:
-      try:
-        print("From: " + message.get("From") + " :: " + str(e))
-      except Exception as f:
-        print("key: " + key + ": " + str(e))
+      msgDate = parse_message_date(message.get("Date"));
+    if msgDate == None:
+      # If we can't find a date in the message, it's garbage.
+      pass
     else:
       if sys.version_info[0] < 3:
         timestamp = (msgDate - datetime.datetime(1970, 1, 1)).total_seconds()
@@ -222,7 +264,8 @@ for key in keys:
         timestamp = msgDate.timestamp()
       msgObj = messageObject(key=key, timestamp=timestamp, message=message)
       messages.append(msgObj)
-      msgSet.add(key)
+      allNow.append(msgObj)
+      msgSet[key] = msgObj
       # Make a topic or add this message to a topic based on the IMAP mailbox name
       catHeaderChunks = []
       try:
@@ -240,31 +283,28 @@ for key in keys:
         # accidentally merges two mailboxes with similar names since no mail would
         # be lost and that scenario is quite unlikely.
         mbnChunks = mailboxName.split()
-        mailboxName = string.join(mbnChunks,'-')
+        mailboxName = '-'.join(mbnChunks)
         
         # Now anything else gets percent-encoded.
-        mailboxName = urllib.quote(mailboxName, '')
+        mailboxName = urllib.parse.quote(mailboxName, '')
         
         if mailboxName not in mailboxes:
-          if mailboxName in topics:
-            mailboxes[mailboxName] = copy.copy(topics[mailboxName][0].messages)
-          else:
-            mailboxes[mailboxName] = []
+          mailboxes[mailboxName] = []
         mailboxArray = mailboxes[mailboxName]
         mailboxArray.append(msgObj)
 
 # Sort the new message list and add a version to the "all" set.
 # Note that if there is an IMAP maibox called "all", this obliterates
 # it.   Tough luck.   Those messages are still the in "all" topic.   :)
-messages.sort(key=lambda foo: foo.timestamp)
-mailboxes['all'] = messages
+allNow.sort()
+mailboxes['all'] = allNow
 
 for mailboxName in mailboxes.keys():
   print(mailboxName + ": " + str(len(mailboxes[mailboxName])))
-  mailboxes[mailboxName].sort(key=lambda foo: foo.timestamp)
+  mailboxes[mailboxName].sort()
   newversion = aVersion(timestamp=time.time(), messages=mailboxes[mailboxName])
   if mailboxName in topics:
-    topics[mailboxName] = [newversion] + topics[mailboxName]
+    topics[mailboxName].append(newversion)
   else:
     topics[mailboxName] = [newversion]
 
@@ -292,48 +332,55 @@ for key, topic in topics.items():
     # that we should have special code that detects this when combing
     # the lists, but the easiest way to detect it is when adding.
     # XXX think about this
+    #output.append("prev: " + str(len(prev)))
+    for item in prev:
+      #output.append("#pre: " + item.key + " " + str(item.timestamp))
+      pass
+    #output.append("msgs: " + str(len(msgs)))
+    for item in msgs:
+      #output.append("#msg: " + item.key + " " + str(item.timestamp))
+      pass
     while old < len(prev) or cur < len(msgs):
       if old < len(prev) and cur < len(msgs):
         # I'm thinking the right way to deal with duplicate keys with different
         # timestamps is to make a list sorted by keys and search for duplicates
         # after creating the list, either by reading it from a file or by
-        # scanning the messages.   For now we treat messages with different key
-        # but identical timestamp as if they are different messages.
-        if (prev[old].key == msgs[cur].key and
-            prev[old].timestamp == msgs[cur].timestamp):
-          print("skip:")
-          print("prev[" + str(old) + "] = " + prev[old].key + " " + str(prev[old].timestamp))
-          print("msgs[" + str(cur) + "] = " + msgs[cur].key + " " + str(msgs[cur].timestamp))
+        # scanning the messages.   For now we treat messages with identical key
+        # that do not appear in order as if they are different messages.
+        if prev[old].key == msgs[cur].key:
+          #output.append("#skip:")
+          #output.append("#prev[" + str(old) + "] = " + prev[old].key + " " + str(prev[old].timestamp))
+          #output.append("#msgs[" + str(cur) + "] = " + msgs[cur].key + " " + str(msgs[cur].timestamp))
           old = old + 1
           cur = cur + 1
         # If the timestamp in prev is greater than in cur,
         # it means that the item in prev isn't present in
         # cur.
         elif prev[old].timestamp > msgs[cur].timestamp:
-          print("delete:")
-          print("prev[" + str(old) + "] = " + prev[old].key + " " + str(prev[old].timestamp))
-          print("msgs[" + str(cur) + "] = " + msgs[cur].key + " " + str(msgs[cur].timestamp))
-          output.append("-" + msgs[cur].key)
-          old = old + 1
-        # Otherwise this item was present in cur but not in prev
-        else:
-          print("add:")
-          print("prev[" + str(old) + "] = " + prev[old].key + " " + str(prev[old].timestamp))
-          print("msgs[" + str(cur) + "] = " + msgs[cur].key + " " + str(msgs[cur].timestamp))
+          #output.append("#add:")
+          #output.append("#prev[" + str(old) + "] = " + prev[old].key + " " + str(prev[old].timestamp))
+          #output.append("#msgs[" + str(cur) + "] = " + msgs[cur].key + " " + str(msgs[cur].timestamp))
           output.append("+" + msgs[cur].key + " " + str(msgs[cur].timestamp))
           cur = cur + 1
+        # Otherwise this item was present in cur but not in prev
+        else:
+          #output.append("#del:")
+          #output.append("#prev[" + str(old) + "] = " + prev[old].key + " " + str(prev[old].timestamp))
+          #output.append("#msgs[" + str(cur) + "] = " + msgs[cur].key + " " + str(msgs[cur].timestamp))
+          output.append("-" + prev[old].key)
+          old = old + 1
       # We have exhausted the contents of the previous version, so this
       # must be an entry that exists only in the current version
       elif old == len(prev):
-        print("otheradd:")
-        print("prev[" + str(old) + "] = Null (limit " + str(len(prev)) + ")")
-        print("msgs[" + str(cur) + "] = " + msgs[cur].key + " " + str(msgs[cur].timestamp))
+        #output.append("#otheradd:")
+        #output.append("#prev[" + str(old) + "] = Null (limit " + str(len(prev)) + ")")
+        #output.append("#msgs[" + str(cur) + "] = " + msgs[cur].key + " " + str(msgs[cur].timestamp))
         output.append("+" + msgs[cur].key + " " + str(msgs[cur].timestamp))
         cur = cur + 1
       else:
-        print("otherdel:")
-        print("prev[" + str(old) + "] = " + prev[old].key + " " + str(prev[old].timestamp))
-        print("msgs[" + str(cur) + "] = Null (limit " + str(len(msgs)) + ")")
+        #output.append("#otherdel:")
+        #output.append("#prev[" + str(old) + "] = " + prev[old].key + " " + str(prev[old].timestamp))
+        #output.append("#msgs[" + str(cur) + "] = Null (limit " + str(len(msgs)) + ")")
         output.append("-" + prev[old].key)
         old = old + 1
     topfile.write(version.to_line(len(output)) + "\n")
@@ -346,21 +393,18 @@ for key, topic in topics.items():
   # to do versioning in subdirectories.
   try:
     os.unlink(topfile_name + ".older")
-  except OSError as e:
-    if e[1] != 'No such file or directory':
-      raise e
+  except FileNotFoundError as e:
+    pass
   try:
     os.link(topfile_name + ".old", topfile_name + ".older")
-  except OSError as e:
-    if e[1] != 'No such file or directory':
-      raise e
+  except FileNotFoundError as e:
+    pass
   else:
     os.unlink(topfile_name + ".old")
   try:
     os.link(topfile_name, topfile_name + ".old")
-  except OSError as e:
-    if e[1] != 'No such file or directory':
-      raise e
+  except FileNotFoundError as e:
+    pass
   else:
     os.unlink(topfile_name)
   os.link(topfile_name + ".new", topfile_name)
