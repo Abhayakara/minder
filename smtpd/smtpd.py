@@ -53,7 +53,8 @@ class userdb:
     # Python's parseaddr function doesn't actually do the right thing
     # here, so for now this is going to be a very manual process,
     # more's the pity.
-    parts = address.split("@")
+    # XXX does this work with unicode?
+    parts = address.lower().split("@")
     if len(parts) != 2:
       return None
     user = parts[0]
@@ -64,7 +65,6 @@ class userdb:
       splode = subdomain.split(".")
       for i in range(0, len(splode)):
         wildsub = "*." + ".".join(splode[i:])
-        print("trying: ", wildsub)
         if wildsub in domains:
           return wildsub
       return None
@@ -111,19 +111,21 @@ class msmtp_channel(smtpd.SMTPChannel):
     udbaddr = self.userdb.parse_address(address)
     if udbaddr == None:
       self.push("501 Syntax: RCPT TO: <address>")
-      print("501 Syntax: RCPT TO: <address>")
+      syslog.syslog(syslog.LOG_INFO, "501 Syntax: RCPT TO: %s" % address)
       return False
     
     if not self.userdb.validate_domain(udbaddr):
       print('551 Not a local domain, relaying not available.')
       self.push('551 Not a local domain, relaying not available.')
+      syslog.syslog(syslog.LOG_INFO,
+		    "551 Invalid domain: RCPT TO: %s" % address)
       return False
 
     if not self.userdb.validate_address(udbaddr):
-      print("550 Mailbox unavailable.")
       self.push("550 Mailbox unavailable.")
+      syslog.syslog(syslog.LOG_INFO,
+		    "550 Invalid mailbox: RCPT TO: %s" % address)
       return False
-
     return True
 
 class msmtpd(smtpd.SMTPServer):
@@ -160,6 +162,15 @@ class msmtpd(smtpd.SMTPServer):
     syslog.syslog(syslog.LOG_INFO, "Mail from %s via %s" % (mailfrom, peer[0]))
     boxes = {}
     self.debugstream.flush()
+    rcvd = "Received: from %s; %s\r\n" % (peer[0], email.utils.formatdate())
+    #parser = email.parser.Parser()
+    #message = None
+    #try:
+    #  message = parser.parsestr(rcvd + data)
+    #except Exception as e:
+    #  syslog.syslog(syslog.LOG_INFO, "Malformed message: %s", str(e))
+
+    #if message != None:
     for rcpt in rcpttos:
       syslog.syslog(syslog.LOG_INFO, "Delivering to %s" % rcpt)
       address = self.userdb.parse_address(rcpt)
@@ -171,10 +182,12 @@ class msmtpd(smtpd.SMTPServer):
       if "mbox" not in slot:
         raise Exception("No mailbox for address %s\n" % rcpt)
       maildir = mailbox.Maildir("/mailboxes/" + slot["mbox"], create=True)
-      rcvd = "Received: from %s; %s\r\n" % (peer[0], email.utils.formatdate())
-      #parser = email.parser.Parser()
-      #message = parser.parsestr(data)
-      maildir.add(rcvd + data)
+      try:
+        maildir.add(rcvd + data)
+      except Exception as e:
+        syslog.syslog(syslog.LOG_INFO, "Malformed message: %s" % str(e))
+        return "501 Malformed message"
+    return False
 
 def run():
   debug = open("/var/log/smtpd.debug", "a")
