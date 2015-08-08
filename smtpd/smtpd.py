@@ -62,8 +62,9 @@ class userdb:
 
   def find_wildcard(self, subdomain, domains):
       splode = subdomain.split(".")
-      for i in range(len(splode), 1, -1):
-        wildsub = "*." + ".".join(splode[1:i])
+      for i in range(0, len(splode)):
+        wildsub = "*." + ".".join(splode[i:])
+        print("trying: ", wildsub)
         if wildsub in domains:
           return wildsub
       return None
