@@ -115,7 +115,6 @@ class msmtp_channel(smtpd.SMTPChannel):
       return False
     
     if not self.userdb.validate_domain(udbaddr):
-      print('551 Not a local domain, relaying not available.')
       self.push('551 Not a local domain, relaying not available.')
       syslog.syslog(syslog.LOG_INFO,
 		    "551 Invalid domain: RCPT TO: %s" % address)
