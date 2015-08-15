@@ -3,19 +3,42 @@
 # Overview:
 #
 # This file implements the minimal SMTP protocol as defined in RFC 5321.
-# The 
+# Both client and server are supported, and rely on the asyncio python
+# library for asynchronous behavior.
 #
 # Based on python smtpd module written by:
 #
 # Author: Barry Warsaw <barry@python.org>
 # 
+# Changes to support SSL transport, asyncio, SASL authentication and
+# so on by Ted Lemon <mellon@fugue.com>
+#
+# This is just the python smtpd module, hacked to add features necessary
+# to do useful stuff like SSL and RCPT to processing and spam filtering.
+# The actual features are added in the subclass, but the existing python
+# module didn't allow the subclass to do things like validate incoming
+# mail addresses.
+# 
+# Done:
+# - Add SSL support
+# - Use asyncio
+# - Add support for AUTH extension (currently just PLAIN, requires SSL)
+# - Add subclass-overridable methods for:
+#   - Validating individual RCPT TO addresses
+#   - Validating MAIL FROM addresses
+#   - Authenticating users
 #
 # TODO:
-#
-# - support mailbox delivery
-# - alias files
-# - Handle more ESMTP extensions
-# - handle error codes from the backend smtpd
+# 
+# - Add subclass-overridable methods for:
+#   - Validating the format of incoming mail and returning an error if in
+#     violation
+#   - Noticing that an incoming message has exceeded the default size and
+#     checking to see if for that particular sender/recipient combination a
+#     larger size is allowed.
+#   - Noticing that an attachment of some type has been presented, and checking
+#     to see if that attachment type is permitted for a particular
+#     sender/recipient combination
 
 import sys
 import os
@@ -27,6 +50,7 @@ import asyncio
 import collections
 import ssl
 import base64
+import syslog
 from warnings import warn
 from email._header_value_parser import get_addr_spec, get_angle_addr
 
@@ -459,8 +483,8 @@ class SMTPServer(asyncio.Protocol):
                 self.push("538-Your mail program just revealed your password.")
                 self.push("538-Please switch to a mail program made by")
                 self.push("538 someone competent.")
-                syslog(syslog.LOG_ERROR,
-                       "PLAIN authentication method used without TLS.");
+                syslog.syslog(syslog.LOG_ERROR,
+                              "PLAIN authentication method used without TLS.");
                 return
             if len(fields) == 1:
                 self.push("334 ");
@@ -490,6 +514,12 @@ class SMTPServer(asyncio.Protocol):
             print("data: ", data)
             return
 
+        # Please be aware that authenticate can have side effects
+        # in the subclass, so if we call self.authenticate, it
+        # means we have authenticated, and that state may come
+        # along with that, so we can't just call it at random
+        # in situations where we don't want that state to come into
+        # being.
         if self.authenticate(username, password):
             self.authenticated = True
             self.authenticated_user = username
