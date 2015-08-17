@@ -70,57 +70,26 @@ EMPTYSTRING = ''
 COMMASPACE = ', '
 DATA_SIZE_DEFAULT = 33554432
 
-
-class SMTPServer(asyncio.Protocol):
-    COMMAND = 0
-    DATA = 1
-    AUTH_PLAIN = 2
-    debugstream = Devnull()
-    authenticated = False
+class _crlfprotocol(asyncio.Protocol):
 
     def __init__(self):
-        self.data_size_limit = DATA_SIZE_DEFAULT
-        self.received_lines = []
-        self.smtp_state = self.COMMAND
-        self.seen_greeting = ''
-        self.mailfrom = None
-        self.rcpttos = []
         self.received_data = ''
         self.num_bytes = 0
-        self.extended_smtp = False
         self.line_oriented = True
         self.received_string = ""
         self.strict_newline = False
 
-    def connection_made(self, transport):
-        self.transport = transport
-        try:
-            self.peer = transport.get_extra_info("peername")
-        except OSError as err:
-            # a race condition  may occur if the other end is closing
-            # before we can get the peername
-            self.close()
-            if err.args[0] != errno.ENOTCONN:
-                raise
-            return
-        print('Peer:', repr(self.peer), file=self.debugstream)
-        self.push('220 greetings.')
-
-    # Overrides base class for convenience
-    def push(self, msg):
-        print("Resp: ", str(msg), file=self.debugstream)
-        self.transport.write(bytes(msg + '\r\n', 'ascii'))
-
     # Implementation of base class abstract method
     # We do line separation here.   Anything higher level
     # than a line is handled by the process_line method
+    # in the subclass.
+
     def data_received(self, data):
         if self.line_oriented:
             try:
                 dstr = str(data, encoding="ascii", errors="strict")
             except:
-                self.push("500 non-ASCII character sequence encountered.")
-                self.transport.close()
+                self.read_error("non-ASCII character sequence encountered.")
                 return
             self.received_string = self.received_string + dstr
             self.num_bytes = self.num_bytes + len(dstr)
@@ -140,16 +109,13 @@ class SMTPServer(asyncio.Protocol):
                 if nlp == -1 and crp == -1:
                     # SMTP only allows 1000 bytes per line.
                     if self.num_bytes > 1000:
-                      self.push("500 too many bytes in a single line.")
-                      self.close()
+                      self.read_error("too many bytes in a single line.")
                     return
                 elif crp == -1 or crp > nlp:
-                    self.push("500 bare newline (ASCII 10) encountered.")
-                    self.transport.close()
+                    self.read_error("bare newline (ASCII 10) encountered.")
                     return
                 elif nlp == -1 or nlp != crp + 1:
-                    self.push("500 bare CR (ASCII 13) encountered.")
-                    self.transport.close()
+                    self.read_error("bare CR (ASCII 13) encountered.")
                     return
 
                 # extract the line, excluding the newline
@@ -161,7 +127,49 @@ class SMTPServer(asyncio.Protocol):
 
                 self.process_line(line)
         else:
-            self.push("451 Internal error.")
+            self.read_error("Internal error.")
+            return
+
+class server(_crlfprotocol):
+    COMMAND = 0
+    DATA = 1
+    AUTH_PLAIN = 2
+    debugstream = Devnull()
+    authenticated = False
+
+    def __init__(self):
+        self.data_size_limit = DATA_SIZE_DEFAULT
+        self.received_lines = []
+        self.smtp_state = self.COMMAND
+        self.seen_greeting = ''
+        self.mailfrom = None
+        self.rcpttos = []
+        self.extended_smtp = False
+        self.line_oriented = True
+        self.strict_newline = False
+
+    def read_error(self, explanation):
+      self.push("500 " + explanation)
+      self.transport.close()
+
+    def connection_made(self, transport):
+        self.transport = transport
+        try:
+            self.peer = transport.get_extra_info("peername")
+        except OSError as err:
+            # a race condition  may occur if the other end is closing
+            # before we can get the peername
+            self.close()
+            if err.args[0] != errno.ENOTCONN:
+                raise
+            return
+        print('Peer:', repr(self.peer), file=self.debugstream)
+        self.push('220 greetings.')
+
+    # Overrides base class for convenience
+    def push(self, msg):
+        print("Resp: ", str(msg), file=self.debugstream)
+        self.transport.write(bytes(msg + '\r\n', 'ascii'))
             
     # Implementation of base class abstract method
     def process_line(self, line):
@@ -527,3 +535,229 @@ class SMTPServer(asyncio.Protocol):
         else:
             self.push("535 Invalid credentials.")
     
+class client(_crlfprotocol):
+    WAITING = 0   # waiting for a response from the server
+    DATA = 1      # In a DATA exchange
+    READY = 2     # ready to send a command to the server
+    debugstream = Devnull()
+    authenticated = False
+
+    def __init__(self):
+        self.data_size_limit = DATA_SIZE_DEFAULT
+        self.received_lines = []
+        self.smtp_state = self.WAITING
+        self.seen_greeting = ''
+        self.mailfrom = None
+        self.rcpttos = []
+        self.extended_smtp = False
+        self.line_oriented = True
+        self.strict_newline = False
+
+    def read_error(self, explanation):
+	self.finished(ReadError(explanation))
+
+    # We don't send anything when the connection starts--we just
+    # wait for the other end to say something.
+    def connection_made(self, transport):
+        self.transport = transport
+        try:
+            self.peer = transport.get_extra_info("peername")
+        except OSError as err:
+            # a race condition  may occur if the other end is closing
+            # before we can get the peername
+            self.finished(str(err))
+            return
+        self.next_state = self.greeting
+        self.repeat_code = None
+        self.received_lines = []
+
+    # Overrides base class for convenience
+    def push(self, msg):
+        print("Resp: ", str(msg), file=self.debugstream)
+        self.transport.write(bytes(msg + '\r\n', 'ascii'))
+            
+    # Implementation of base class abstract method
+    def process_line(self, line):
+        print('Data:', repr(line), file=self.debugstream)
+        if self.smtp_state == self.WAITING:
+            self.parse_response_line(line)
+            return
+	elif self.state == self.READY:
+	    # Shouldn't be getting input in this state because
+	    # we haven't said anything.
+	    self.finish(UnexpectedInput(line))
+	    return
+        else:
+            self.push('451 Internal confusion')
+            self.num_data_bytes = 0
+            self.received_lines = []
+            return
+
+    def parse_response_line(self, line):
+	if len(line) < 4:
+            self.finish(InvalidResponse(message="Short response line", data = line))
+            return
+	code = line[0:3]
+	more = line[3]
+	text = line[4:]
+	if self.repeat_code != None:
+	    if self.repeat_code != code:
+	      self.finish(InvalidResponse(message="Conflicting response codes",
+                                          data=[code, self.repeat_code],
+                                          self.received_lines))
+	else:
+	    self.repeat_code = code
+	self.received_lines.append(text)
+	if more == " ":
+	    response_lines = self.received_lines
+	    self.repeat_code = None
+	    self.received_lines = []
+	    next_state = self.next_state
+	    self.next_state = None
+	    next_state(code, response_lines)
+	    self.state = self.READY
+
+    # Called when we get the initial greeting from the server.
+    def greeting(self, code, lines):
+	# If we get a 504, this server won't talk to us.
+	if code == "504":
+	    self.finished(code + ": " + repr(lines))
+	    return
+	if code != "200":
+	    self.finished(InvalidResponseCode(message="Invalid greeting",
+                                              code=code, data=lines)
+	    return
+	# Otherwise we got a 200 code.
+	self.push("EHLO " + self.name)
+	self.next_state = self.ehlo_response
+	return
+
+    # We sent an EHLO, what'd we get back?
+    def ehlo_response(self, code, lines):
+	if code == "502" or code == "500":
+	    self.push("HELO " + self.name)
+	    self.next_state = helo_response
+	    return
+	if code != "250":
+	    self.finished(InvalidResponseCode(message="Invalid EHLO response",
+                                              code=code, data=lines)
+	    return
+
+	# We got a 250, which means we probably got some capability
+	# advertisements, so parse them:
+	self.capabilities = {}
+	for line in lines[1:]:
+	    chunks = line.split(" ")
+	    if len(chunks) != 0:
+		self.capabilities[chunks[0]] = chunks[1:]
+	self.ready()
+	return
+
+    def helo_response(self, code, lines):
+	if code != "250":
+	    self.finished(InvalidResponseCode(message="Invalid HELO response",
+                                              code=code, data=lines)
+	    return
+	self.ready()
+	return
+
+    def finished(self, exception):
+	self.transport.close()
+	if self.statfuture != None:
+	    self.statfuture.set_exception(exception)
+	    self.statfuture = None
+	return
+
+    def ready(self):
+	if self.statfuture != None:
+	    self.statfuture.set_result(True)
+	    self.statfuture = None
+	return
+
+    def mail_from(self, address):
+        return self.send_command("MAIL FROM: <" + address + ">",
+                                 self.addr_response)
+
+    def send_command(self, command, response_callback):
+	if self.status != self.READY:
+            raise InvalidState("Not ready to send a new command.")
+	self.state = self.WAITING
+	self.next_state = response_callback
+	self.push(command)
+	self.statfuture = asyncio.futures.Future()
+	return self.statfuture
+
+    # This is a really simple failure check for cases where we don't actually care
+    # what the failure was, but just whether it was temporary or permanent.
+    def naive_failure(self, code, lines):
+        # Permanent failure
+	if code[0] == '5':
+          self.statfuture.set_exception(PermanentFailure(code=code, data=lines))
+          return True
+        if code[0] == '4':
+          self.statfuture.set_exception(TemporaryFailure(code=code, data=lines))
+          return True
+        return False
+
+    # Process a response to a MAIL FROM: or RCPT TO: command
+    def addr_response(self, code, lines):
+        # If we can't return a result, no point in processing it.
+        if self.statfuture == None:
+          return
+        if self.naive_failure(code, lines):
+          return
+        if code != "250":
+	  self.finished(InvalidResponseCode(message="Invalid addr response",
+                                            code=code, data=lines)
+          return
+        self.ready()
+        return
+
+    def rcpt_to(self, address):
+        return self.send_command("RCPT TO: <" + address + ">", addr_response)
+
+    def data(self, data):
+        return self.send_command("DATA", data_response)
+
+    # This tells us whether it's okay to go ahead and send data.
+    def data_response(self, code, lines):
+        if self.statfuture == None:
+          return
+        if self.naivefailure(code, lines):
+          return
+        if code != "354":
+	  self.finished(InvalidResponseCode(message="Invalid DATA response",
+                                            code=code, data=lines))
+          return
+        self.state = self.DATA
+        self.statfuture = asyncio.futures.Future()
+        return self.statfuture
+    
+    # So named because we assume the data is already transparent.
+    # XXX:
+    # I am not convinced that this code will do the right thing
+    # if data comes in from the mail program faster than the
+    # recipient mailer is willing to take it.   This probably
+    # won't show up at first, so figure out what will happen in
+    # this case and fix it.  Even if it sort of works, it could
+    # wind up buffering the entire message in memory and then
+    # slowly draining that buffer.
+    def send_transparent_data(self, data):
+        self.transport.write(data)
+	return
+
+    def data_done_response(self, data):
+      if self.statfuture != None:
+        return
+      if self.naivefailure(code, lines):
+        return
+      if code != "250":
+	  self.finished(InvalidResponseCode(message="Invalid DATA response",
+                                            code=code, data=lines))
+
+    def shutdown(self, data):
+        return self.send_command("QUIT", self.quit_response)
+
+    def quit_response(self, code, lines):
+        self.transport.close()
+        return
