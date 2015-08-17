@@ -553,6 +553,13 @@ class client(_crlfprotocol):
         self.line_oriented = True
         self.strict_newline = False
 
+    def is_ready(self):
+        if self.smtp_state == self.READY:
+            return None
+        else
+            self.statfuture = asyncio.futures.Future()
+            return self.statfuture
+    
     def read_error(self, explanation):
 	self.finished(ReadError(explanation))
 
@@ -670,7 +677,7 @@ class client(_crlfprotocol):
 
     def ready(self):
 	if self.statfuture != None:
-	    self.statfuture.set_result(True)
+	    self.statfuture.set_result(self)
 	    self.statfuture = None
 	return
 
