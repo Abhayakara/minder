@@ -256,6 +256,7 @@ class msmtp(smtps.SMTPServer):
     
   # Do all the MX fiddling to get a connection to the specified domain
   # if we don't already have one.
+  @asyncio.coroutine
   def get_connection(self, domain):
     # We're already connected.   Just return the connection.
     if domain in self.connections:
@@ -363,14 +364,15 @@ class msmtp(smtps.SMTPServer):
     # It should be rare that a connection takes longer than five
     # seconds to complete if the exchange is reachable.
     try:
-      connection = self.connect_to_addresses(addrs, 5, self.initialize_connection)
-    except smtpc.TemporaryFailure as x:
+      connection = self.connect_to_addresses(addrs, 5,
+					     self.initialize_connection)
+    except smtp.TemporaryFailure as x:
       # Temporary failure; we just have to stash the message for this
       # address.
       self.connections[user + "@" + domain] = None
       self.connections[domain] = None
       return True
-    except smtpc.PermanentFailure as x:
+    except smtp.PermanentFailure as x:
       self.push("550 " + str(x))
       # Remember the exception in case there's another RCPT TO:
       # for this domain.
@@ -380,22 +382,56 @@ class msmtp(smtps.SMTPServer):
     self.connections[domain] = connection
     return True
 
+  @asyncio.coroutine
   def connect_to_addresses(self, addresses, interval, initialize):
+    tasks = []
+    client_futs = []
+    connection = None
 
-    # Get an SMTP client object for this connection.
-    connection = smtpc.SMTPClient(sock)
-
-    # Let it do the initial handshake.
-    status = yield from connection.start()
-    if status.failure:
-      if status
-
+    # Loop through the addresses, starting a connection to the next
+    # one every _interval_ seconds.   When we have a connection,
+    # wait for it to become ready.
+    for (address, family, name) in addresses:
+      print("Connecting to", name, "at", address)
+      co = asyncio.create_connection(smtp.client, host=address, port=25, family=family)
+      task = asyncio.ensure_future(co)
+      tasks.append(task)
+      alltasks = tasks.copy().extend(client_futs)
+      co2 = asyncio.wait(alltasks, timeout=interval, return_when=concurrent.futures.FIRST_COMPLETED)
+      # Wait up to _interval_ seconds for this task or any task created in a
+      # previous iteration to complete.
+      (complete, pending) = yield from co2
+      # if any tasks completed, try to establish a conversation on the
+      # corresponding socket.
+      for task in complete:
+        # If the future was cancelled, it was by something at a higher
+        # level, so we should just stop.
+        if task.cancelled():
+          return
+        # If we didn't get an exception, then we should have a connected
+        # socket.
+        if task.exception() == None:
+          if task in tasks:
+            (transport, client) = task.result()
+            fut = client.is_ready()
+            if fut == None:
+              connection = client
+            else:
+              client_futs.append(fut)
+          elif task in client_futs:
+            connection = task.result()
+          else:
+            print("Weird: %s completed but not in %s or %s" % (task, tasks, client_futs))
+        if task in tasks:
+          tasks.remove(task)
+        else:
+          client_futs.remove(task)
+        if connection != None:
+          break
+            
     # Identify the sender of the current transaction.
     yield from connection.mail_from(self.mail_from)
-
-    # XXX say helo, send mail from
-
-    # return true
+    return connection
 
   # In validate_recipient, we actually try to connect to the mail
   # server for the specified recipient.   If more than one recipient
@@ -412,10 +448,11 @@ class msmtp(smtps.SMTPServer):
   # as possible.   Store-and-forward may be necessary for some
   # locales where network connectivity is poor, but should not
   # be necessary in most cases.
+  @asyncio.coroutine
   def validate_recipient(self, user, domain):
     # If we get a False back from get_connection, it means we
     # invalidated the sender and sent a 550 response.
-    if not self.get_connection(domain):
+    if not yield from self.get_connection(domain):
       return False
 
     # Otherwise, see if there's a connection.   There will either
@@ -429,9 +466,7 @@ class msmtp(smtps.SMTPServer):
     if connection == None:
       return True
     
-    # send rcpt to
-
-    # return true
+    return (yield from connection.send_rcpt_to(user + "@" + domain))
     
   def validate_mailbox(self, address):
     if not self.userdb.validate_domain(address):
