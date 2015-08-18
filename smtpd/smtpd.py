@@ -199,7 +199,7 @@ class userdb(coldb):
       return False
     return True
 
-class msmtp(smtps.SMTPServer):
+class msmtp(smtp.server):
   userdb = None
   mailbox = None
 
@@ -310,7 +310,7 @@ class msmtp(smtps.SMTPServer):
           self.fetch_addrs(mx.exchange, arecs, a4recs)
         if len(arecs) > 0 or len(a4recs) > 0:
           entry = { "exchange": mx.exchange,
-                    "a": arecs, "aaaa", a4recs}
+                    "a": arecs, "aaaa": a4recs}
           if mx.preference in mxs:
             mxs[mx.preference].append(entry)
           else:
@@ -452,7 +452,7 @@ class msmtp(smtps.SMTPServer):
   def validate_recipient(self, user, domain):
     # If we get a False back from get_connection, it means we
     # invalidated the sender and sent a 550 response.
-    if not yield from self.get_connection(domain):
+    if not (yield from self.get_connection(domain)):
       return False
 
     # Otherwise, see if there's a connection.   There will either
@@ -532,14 +532,19 @@ minder_uent = pwd.getpwnam("minder")
 minder_user = minder_uent.pw_uid
 
 # Load the TLS certs...
-tlscf = tlsconf()
+tlsctx = None
+try:
+  tlscf = tlsconf()
+  tlsctx = tlscf.tlsctx
+except:
+  pass
 
 # Get the vent loop...
 loop = asyncio.get_event_loop()
 
 # Create a listener...
-coroutine = loop.create_server(msmtp, "localhost", 465, family=socket.AF_INET,
-                               ssl=tlscf.tlsctx, backlog=5, reuse_address=True)
+coroutine = loop.create_server(msmtp, "localhost", 587, family=socket.AF_INET,
+                               ssl=tlsctx, backlog=5, reuse_address=True)
 tlsserver = loop.run_until_complete(coroutine)
 
 # XXX fork, close listen socket, chroot, setuid
