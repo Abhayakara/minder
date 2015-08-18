@@ -556,12 +556,12 @@ class client(_crlfprotocol):
     def is_ready(self):
         if self.smtp_state == self.READY:
             return None
-        else
+        else:
             self.statfuture = asyncio.futures.Future()
             return self.statfuture
     
     def read_error(self, explanation):
-	self.finished(ReadError(explanation))
+        self.finished(ReadError(explanation))
 
     # We don't send anything when the connection starts--we just
     # wait for the other end to say something.
@@ -589,11 +589,11 @@ class client(_crlfprotocol):
         if self.smtp_state == self.WAITING:
             self.parse_response_line(line)
             return
-	elif self.state == self.READY:
-	    # Shouldn't be getting input in this state because
-	    # we haven't said anything.
-	    self.finish(UnexpectedInput(line))
-	    return
+        elif self.state == self.READY:
+            # Shouldn't be getting input in this state because
+            # we haven't said anything.
+            self.finish(UnexpectedInput(line))
+            return
         else:
             self.push('451 Internal confusion')
             self.num_data_bytes = 0
@@ -601,104 +601,104 @@ class client(_crlfprotocol):
             return
 
     def parse_response_line(self, line):
-	if len(line) < 4:
+        if len(line) < 4:
             self.finish(InvalidResponse(message="Short response line", data = line))
             return
-	code = line[0:3]
-	more = line[3]
-	text = line[4:]
-	if self.repeat_code != None:
-	    if self.repeat_code != code:
-	      self.finish(InvalidResponse(message="Conflicting response codes",
-                                          data=[code, self.repeat_code],
-                                          self.received_lines))
-	else:
-	    self.repeat_code = code
-	self.received_lines.append(text)
-	if more == " ":
-	    response_lines = self.received_lines
-	    self.repeat_code = None
-	    self.received_lines = []
-	    next_state = self.next_state
-	    self.next_state = None
-	    next_state(code, response_lines)
-	    self.state = self.READY
+        code = line[0:3]
+        more = line[3]
+        text = line[4:]
+        if self.repeat_code != None:
+            if self.repeat_code != code:
+              self.finish(InvalidResponseCode(message="Conflicting response codes",
+                                          code=[code, self.repeat_code],
+                                          data=self.received_lines))
+        else:
+            self.repeat_code = code
+        self.received_lines.append(text)
+        if more == " ":
+            response_lines = self.received_lines
+            self.repeat_code = None
+            self.received_lines = []
+            next_state = self.next_state
+            self.next_state = None
+            next_state(code, response_lines)
+            self.state = self.READY
 
     # Called when we get the initial greeting from the server.
     def greeting(self, code, lines):
-	# If we get a 504, this server won't talk to us.
-	if code == "504":
-	    self.finished(code + ": " + repr(lines))
-	    return
-	if code != "200":
-	    self.finished(InvalidResponseCode(message="Invalid greeting",
-                                              code=code, data=lines)
-	    return
-	# Otherwise we got a 200 code.
-	self.push("EHLO " + self.name)
-	self.next_state = self.ehlo_response
-	return
+        # If we get a 504, this server won't talk to us.
+        if code == "504":
+            self.finished(code + ": " + repr(lines))
+            return
+        if code != "200":
+            self.finished(InvalidResponseCode(message="Invalid greeting",
+                                              code=code, data=lines))
+            return
+        # Otherwise we got a 200 code.
+        self.push("EHLO " + self.name)
+        self.next_state = self.ehlo_response
+        return
 
     # We sent an EHLO, what'd we get back?
     def ehlo_response(self, code, lines):
-	if code == "502" or code == "500":
-	    self.push("HELO " + self.name)
-	    self.next_state = helo_response
-	    return
-	if code != "250":
-	    self.finished(InvalidResponseCode(message="Invalid EHLO response",
-                                              code=code, data=lines)
-	    return
+        if code == "502" or code == "500":
+            self.push("HELO " + self.name)
+            self.next_state = helo_response
+            return
+        if code != "250":
+            self.finished(InvalidResponseCode(message="Invalid EHLO response",
+                                              code=code, data=lines))
+            return
 
-	# We got a 250, which means we probably got some capability
-	# advertisements, so parse them:
-	self.capabilities = {}
-	for line in lines[1:]:
-	    chunks = line.split(" ")
-	    if len(chunks) != 0:
-		self.capabilities[chunks[0]] = chunks[1:]
-	self.ready()
-	return
+        # We got a 250, which means we probably got some capability
+        # advertisements, so parse them:
+        self.capabilities = {}
+        for line in lines[1:]:
+            chunks = line.split(" ")
+            if len(chunks) != 0:
+                self.capabilities[chunks[0]] = chunks[1:]
+        self.ready()
+        return
 
     def helo_response(self, code, lines):
-	if code != "250":
-	    self.finished(InvalidResponseCode(message="Invalid HELO response",
-                                              code=code, data=lines)
-	    return
-	self.ready()
-	return
+        if code != "250":
+            self.finished(InvalidResponseCode(message="Invalid HELO response",
+                                              code=code, data=lines))
+            return
+        self.ready()
+        return
 
     def finished(self, exception):
-	self.transport.close()
-	if self.statfuture != None:
-	    self.statfuture.set_exception(exception)
-	    self.statfuture = None
-	return
+        self.transport.close()
+        if self.statfuture != None:
+            self.statfuture.set_exception(exception)
+            self.statfuture = None
+        return
 
     def ready(self):
-	if self.statfuture != None:
-	    self.statfuture.set_result(self)
-	    self.statfuture = None
-	return
+        if self.statfuture != None:
+            self.statfuture.set_result(self)
+            self.statfuture = None
+        return
 
     def mail_from(self, address):
         return self.send_command("MAIL FROM: <" + address + ">",
                                  self.addr_response)
 
     def send_command(self, command, response_callback):
-	if self.status != self.READY:
+        if self.status != self.READY:
             raise InvalidState("Not ready to send a new command.")
-	self.state = self.WAITING
-	self.next_state = response_callback
-	self.push(command)
-	self.statfuture = asyncio.futures.Future()
-	return self.statfuture
+        self.state = self.WAITING
+        self.next_state = response_callback
+        self.push(command)
+        self.statfuture = asyncio.futures.Future()
+        return self.statfuture
 
     # This is a really simple failure check for cases where we don't actually care
     # what the failure was, but just whether it was temporary or permanent.
     def naive_failure(self, code, lines):
         # Permanent failure
-	if code[0] == '5':
+        if code[0] == '5':
           self.statfuture.set_exception(PermanentFailure(code=code, data=lines))
           return True
         if code[0] == '4':
@@ -714,8 +714,8 @@ class client(_crlfprotocol):
         if self.naive_failure(code, lines):
           return
         if code != "250":
-	  self.finished(InvalidResponseCode(message="Invalid addr response",
-                                            code=code, data=lines)
+          self.finished(InvalidResponseCode(message="Invalid addr response",
+                                            code=code, data=lines))
           return
         self.ready()
         return
@@ -733,7 +733,7 @@ class client(_crlfprotocol):
         if self.naivefailure(code, lines):
           return
         if code != "354":
-	  self.finished(InvalidResponseCode(message="Invalid DATA response",
+          self.finished(InvalidResponseCode(message="Invalid DATA response",
                                             code=code, data=lines))
           return
         self.state = self.DATA
@@ -751,7 +751,7 @@ class client(_crlfprotocol):
     # slowly draining that buffer.
     def send_transparent_data(self, data):
         self.transport.write(data)
-	return
+        return
 
     def data_done_response(self, data):
       if self.statfuture != None:
@@ -759,7 +759,7 @@ class client(_crlfprotocol):
       if self.naivefailure(code, lines):
         return
       if code != "250":
-	  self.finished(InvalidResponseCode(message="Invalid DATA response",
+          self.finished(InvalidResponseCode(message="Invalid DATA response",
                                             code=code, data=lines))
 
     def shutdown(self, data):
