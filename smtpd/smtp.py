@@ -53,13 +53,92 @@ import base64
 import syslog
 from warnings import warn
 from email._header_value_parser import get_addr_spec, get_angle_addr
+import traceback
+import types
+import pdb
 
-__all__ = ["SMTPServer"]
+__all__ = ["ReadError", "InvalidState", "TemporaryFailure",
+           "PermanentFailure", "InvalidResponseCode", "server", "client"]
 
 program = sys.argv[0]
 __version__ = 'Python SMTP protocol server version 0.1';
 
+class _MessageException(Exception):
+    message = None
+    name = "MessageException"
+    
+    def __init__(self, message):
+        self.message = message
 
+    def __str__(self):
+        return self.name + ": " + self.message
+
+    def __repr__(self):
+        return "<smtp." + self.name + ": \"" + self.message + "\">"
+
+class ReadError(_MessageException):
+    name = "ReadError"
+
+class InvalidState(_MessageException):
+    name = "InvalidState"
+
+class _CodeFailure(Exception):
+    message = " "
+    name = "CodeFailure"
+    code = None
+    data = None
+
+    def __init__(self, message=" ", code="", data=None):
+        self.message = message
+        self.code = code
+        self.data = data
+
+    def __str__(self):
+        if isinstance(self.code, list):
+            code = repr(self.code)
+        else:
+            code = self.code
+        if len(self.data) == 1:
+            data = self.data[0]
+        else:
+            data = repr(self.data)
+            
+        return self.name + ": " + self.message + "(" + code + " " + data + ")"
+
+    def __repr__(self):
+        if isinstance(self.code, list):
+            code = repr(self.code)
+        else:
+            code = self.code
+        if len(self.data) == 1:
+            data = self.data[0]
+        else:
+            data = repr(self.data)
+            
+        return ("<smtp." + self.name + ": " + code + " \"" +
+                self.message + data + ">")
+
+    # Make up a response using the code we were send.
+    def response(self):
+        responses = []
+        for line in self.data:
+            responses.append(self.code + "-" + line)
+        last = responses[-1]
+        last = last[:3] + " " + last[4:]
+        responses[-1] = last
+        return responses
+    
+class TemporaryFailure(_CodeFailure):
+    name = "TemporaryFailure"
+    
+class PermanentFailure(_CodeFailure):
+    name = "PermanentFailure"
+
+class InvalidResponseCode(_CodeFailure):
+    name = "InvalidResponseCode"
+    def response(self):
+        return ["451 " + self.message]
+    
 class Devnull:
     def write(self, msg): pass
     def flush(self): pass
@@ -71,13 +150,13 @@ COMMASPACE = ', '
 DATA_SIZE_DEFAULT = 33554432
 
 class _crlfprotocol(asyncio.Protocol):
+    num_bytes = 0
+    line_oriented = True
+    received_string = ""
+    strict_newline = False
 
     def __init__(self):
-        self.received_data = ''
-        self.num_bytes = 0
-        self.line_oriented = True
-        self.received_string = ""
-        self.strict_newline = False
+        pass
 
     # Implementation of base class abstract method
     # We do line separation here.   Anything higher level
@@ -127,8 +206,13 @@ class _crlfprotocol(asyncio.Protocol):
 
                 self.process_line(line)
         else:
-            self.read_error("Internal error.")
+            self.process_chunk(data)
             return
+
+    # If the subclass wants non-line-oriented data, they have to 
+    # override this.
+    def process_chunk(self, data):
+        pass
 
 class server(_crlfprotocol):
     COMMAND = 0
@@ -147,6 +231,7 @@ class server(_crlfprotocol):
         self.extended_smtp = False
         self.line_oriented = True
         self.strict_newline = False
+        self.debugstream = sys.stdout
 
     def read_error(self, explanation):
       self.push("500 " + explanation)
@@ -192,7 +277,7 @@ class server(_crlfprotocol):
                 return
             method(arg)
             return
-        elif self.smtp_state == AUTH_PLAIN:
+        elif self.smtp_state == self.AUTH_PLAIN:
             auth_plain(line)
             return
         else:
@@ -221,11 +306,11 @@ class server(_crlfprotocol):
             self.received_lines.append(line)
 
     def process_data(self):
-        self.received_data = NEWLINE.join(self.received_lines)
+        received_data = NEWLINE.join(self.received_lines)
         status = self.process_message(self.peer,
                                       self.mailfrom,
                                       self.rcpttos,
-                                      self.received_data)
+                                      received_data)
         self.rcpttos = []
         self.mailfrom = None
         self.smtp_state = self.COMMAND
@@ -283,7 +368,18 @@ class server(_crlfprotocol):
         # args is ignored
         self.push('221 Bye')
         self.transport.close()
+        self.closed()
 
+    # Subclass should override if wants to know when protocol has been
+    # completed.
+    def closed(self):
+        pass
+
+    # Subclass may also want to notify controller when connection has
+    # been dropped or lost.
+    def connection_lost(self, exception):
+        self.closed()
+        
     def _strip_command_keyword(self, keyword, arg):
         keylen = len(keyword)
         if arg[:keylen].upper() == keyword:
@@ -394,11 +490,29 @@ class server(_crlfprotocol):
         if len(params.keys()) > 0:
             self.push('555 MAIL FROM parameters not recognized or not implemented')
             return
+
+        # The caller may have to block, so we do sender validation
+        # in a coroutine.
+        co = self.mail_worker(address)
+        asyncio.async(co)
+
+    @asyncio.coroutine
+    def mail_worker(self, address):
+        
+        result = self.validate_mailfrom(address)
+        # We called a coroutine, so we need to let it run.
+        if isinstance(result, types.GeneratorType):
+            result = yield from result
+        if not result:
+            # validate_mailfrom sent the response.
+            return
+        
         self.mailfrom = address
         print('sender:', self.mailfrom, file=self.debugstream)
         self.push('250 OK')
 
     def smtp_RCPT(self, arg):
+        print("smtp rcpt")
         if not self.seen_greeting:
             self.push('503 Error: send HELO first');
             return
@@ -435,13 +549,36 @@ class server(_crlfprotocol):
         if not address:
             self.push('501 Syntax: RCPT TO: <address>')
             return
-        # XXX caller is responsible for sending error response if validation fails.
-        if not self.validate_rcptto(address):
-          return
-        self.rcpttos.append(address)
-        print('recips:', self.rcpttos, file=self.debugstream)
-        self.push('250 OK')
 
+        # The caller may have to block, so we do recipient validation
+        # in a coroutine.
+        co = self.rcpt_worker(address)
+        asyncio.async(co)
+
+    @asyncio.coroutine
+    def rcpt_worker(self, address):
+        # XXX caller is responsible for sending error response if
+        # validation fails.
+        status = self.validate_rcptto(address)
+        # We called a coroutine, so we need to let it run.
+        if isinstance(status, types.GeneratorType):
+            try:
+                status = yield from status
+            except Exception as x:
+                self.push("451 kaplui")
+                syslog.syslog(syslog.LOG_ERR, str(x))
+                traceback.print_last()
+                return
+        if status == False:
+            return
+        elif status == True:
+            self.rcpttos.append(address)
+            print('recips:', self.rcpttos, file=self.debugstream)
+            self.push('250 OK')
+            return
+        else:
+            print("invalid status:", repr(status))
+      
     def validate_rcptto(self, address):
       return True
 
@@ -452,9 +589,14 @@ class server(_crlfprotocol):
         # Resets the sender, recipients, and data, but not the greeting
         self.mailfrom = None
         self.rcpttos = []
-        self.received_data = ''
+        self.received_string = ''
+        self.num_bytes = 0
         self.smtp_state = self.COMMAND
         self.push('250 OK')
+        self.reset()
+
+    def reset(self):
+        pass
 
     def smtp_DATA(self, arg):
         if not self.seen_greeting:
@@ -469,8 +611,14 @@ class server(_crlfprotocol):
         self.smtp_state = self.DATA
         self.num_data_bytes = 0
         self.received_lines = []
-        self.push('354 End data with <CR><LF>.<CR><LF>')
+        # The subclass may want to process the data without parsing it
+        # line-by-line.
+        if not self.data_mode():
+            self.push('354 End data with <CR><LF>.<CR><LF>')
 
+    def data_mode(self):
+        return False
+    
     # Commands that have not been implemented
     def smtp_EXPN(self, arg):
         self.push('502 EXPN not implemented')
@@ -487,11 +635,13 @@ class server(_crlfprotocol):
             self.push("500 Syntax: AUTH METHOD[ <initial response>]")
 
         if fields[0] == "PLAIN":
-            if self.transport.get_extra_info("cipher") == None:
+            print(self.peer)
+            if (self.peer[0] != "127.0.0.1" and self.peer[0] != "::1" and
+        	self.transport.get_extra_info("cipher") == None):
                 self.push("538-Your mail program just revealed your password.")
                 self.push("538-Please switch to a mail program made by")
-                self.push("538 someone competent.")
-                syslog.syslog(syslog.LOG_ERROR,
+                self.push("538 someone with some security fu.")
+                syslog.syslog(syslog.LOG_ERR,
                               "PLAIN authentication method used without TLS.");
                 return
             if len(fields) == 1:
@@ -552,14 +702,9 @@ class client(_crlfprotocol):
         self.extended_smtp = False
         self.line_oriented = True
         self.strict_newline = False
+        self.statfuture = None
+        self.debugstream = sys.stdout
 
-    def is_ready(self):
-        if self.smtp_state == self.READY:
-            return None
-        else:
-            self.statfuture = asyncio.futures.Future()
-            return self.statfuture
-    
     def read_error(self, explanation):
         self.finished(ReadError(explanation))
 
@@ -572,27 +717,41 @@ class client(_crlfprotocol):
         except OSError as err:
             # a race condition  may occur if the other end is closing
             # before we can get the peername
-            self.finished(str(err))
+            self.finished(err)
             return
         self.next_state = self.greeting
         self.repeat_code = None
         self.received_lines = []
+        self.state = self.WAITING
+
+    # The controller needs to wait for the greeting to happen,
+    # and for data acknowledgment to come back.  is_ready provides
+    # a point of intercession
+    def is_ready(self):
+        if self.state == self.READY:
+            # In this case we managed to get the greeting
+            # before the controller had a chance to wait
+            # for it, so just return None to indicate
+            # that it's not necessary to wait.
+            return None
+        self.statfuture = asyncio.futures.Future()
+        return self.statfuture        
 
     # Overrides base class for convenience
     def push(self, msg):
-        print("Resp: ", str(msg), file=self.debugstream)
+        print("Command: ", str(msg), file=self.debugstream)
         self.transport.write(bytes(msg + '\r\n', 'ascii'))
             
     # Implementation of base class abstract method
     def process_line(self, line):
-        print('Data:', repr(line), file=self.debugstream)
+        print('Response:', repr(line), file=self.debugstream)
         if self.smtp_state == self.WAITING:
             self.parse_response_line(line)
             return
         elif self.state == self.READY:
             # Shouldn't be getting input in this state because
             # we haven't said anything.
-            self.finish(UnexpectedInput(line))
+            self.finished(UnexpectedInput(line))
             return
         else:
             self.push('451 Internal confusion')
@@ -602,16 +761,16 @@ class client(_crlfprotocol):
 
     def parse_response_line(self, line):
         if len(line) < 4:
-            self.finish(InvalidResponse(message="Short response line", data = line))
+            self.finished(InvalidResponseCode(message="Short response line", data = line))
             return
         code = line[0:3]
         more = line[3]
         text = line[4:]
         if self.repeat_code != None:
             if self.repeat_code != code:
-              self.finish(InvalidResponseCode(message="Conflicting response codes",
-                                          code=[code, self.repeat_code],
-                                          data=self.received_lines))
+              self.finished(InvalidResponseCode(message="Conflicting response codes",
+                                                code=[code, self.repeat_code],
+                                                data=self.received_lines))
         else:
             self.repeat_code = code
         self.received_lines.append(text)
@@ -621,23 +780,29 @@ class client(_crlfprotocol):
             self.received_lines = []
             next_state = self.next_state
             self.next_state = None
-            next_state(code, response_lines)
             self.state = self.READY
+            next_state(code, response_lines)
 
     # Called when we get the initial greeting from the server.
     def greeting(self, code, lines):
         # If we get a 504, this server won't talk to us.
         if code == "504":
-            self.finished(code + ": " + repr(lines))
+            self.finished(PermanentError(code=code, data=lines))
             return
-        if code != "200":
+        if code != "220":
             self.finished(InvalidResponseCode(message="Invalid greeting",
                                               code=code, data=lines))
             return
-        # Otherwise we got a 200 code.
-        self.push("EHLO " + self.name)
-        self.next_state = self.ehlo_response
+        self.ready(None)
         return
+
+    # Once we have connected and gotten a valid greeting line, we
+    # let our controller tell us to send the EHLO/HELO sequence.
+    # The main reason for this is so that the controller can
+    # provide a domain name for us to send to the server.
+    def hello(self, name):
+        self.name = name
+        return self.send_command("EHLO " + name, self.ehlo_response)
 
     # We sent an EHLO, what'd we get back?
     def ehlo_response(self, code, lines):
@@ -657,7 +822,7 @@ class client(_crlfprotocol):
             chunks = line.split(" ")
             if len(chunks) != 0:
                 self.capabilities[chunks[0]] = chunks[1:]
-        self.ready()
+        self.ready(self)
         return
 
     def helo_response(self, code, lines):
@@ -665,28 +830,35 @@ class client(_crlfprotocol):
             self.finished(InvalidResponseCode(message="Invalid HELO response",
                                               code=code, data=lines))
             return
-        self.ready()
+        self.ready(self)
         return
 
     def finished(self, exception):
+        syslog.syslog(syslog.LOG_INFO, str(exception))
         self.transport.close()
         if self.statfuture != None:
             self.statfuture.set_exception(exception)
             self.statfuture = None
+        else:
+            raise exception
         return
 
-    def ready(self):
+    def ready(self, rv):
+        if self.state != self.READY:
+            traceback.print_stack()
+            print("Entered ready but not in READY state.")
+        print("ready.")
         if self.statfuture != None:
             self.statfuture.set_result(self)
             self.statfuture = None
-        return
+        return rv
 
     def mail_from(self, address):
         return self.send_command("MAIL FROM: <" + address + ">",
                                  self.addr_response)
 
     def send_command(self, command, response_callback):
-        if self.status != self.READY:
+        if self.state != self.READY:
             raise InvalidState("Not ready to send a new command.")
         self.state = self.WAITING
         self.next_state = response_callback
@@ -694,15 +866,18 @@ class client(_crlfprotocol):
         self.statfuture = asyncio.futures.Future()
         return self.statfuture
 
-    # This is a really simple failure check for cases where we don't actually care
-    # what the failure was, but just whether it was temporary or permanent.
+    # This is a really simple failure check for cases where we don't
+    # actually care what the failure was, but just whether it was
+    # temporary or permanent.
     def naive_failure(self, code, lines):
         # Permanent failure
         if code[0] == '5':
-          self.statfuture.set_exception(PermanentFailure(code=code, data=lines))
+          self.statfuture.set_exception(PermanentFailure(code=code,
+                                                         data=lines))
           return True
         if code[0] == '4':
-          self.statfuture.set_exception(TemporaryFailure(code=code, data=lines))
+          self.statfuture.set_exception(TemporaryFailure(code=code,
+                                                         data=lines))
           return True
         return False
 
@@ -717,28 +892,32 @@ class client(_crlfprotocol):
           self.finished(InvalidResponseCode(message="Invalid addr response",
                                             code=code, data=lines))
           return
-        self.ready()
+        self.ready(None)
         return
 
     def rcpt_to(self, address):
-        return self.send_command("RCPT TO: <" + address + ">", addr_response)
+        return self.send_command("RCPT TO: <" + address + ">",
+                                 self.addr_response)
 
-    def data(self, data):
-        return self.send_command("DATA", data_response)
+    def data(self):
+        return self.send_command("DATA", self.data_response)
 
     # This tells us whether it's okay to go ahead and send data.
     def data_response(self, code, lines):
         if self.statfuture == None:
-          return
-        if self.naivefailure(code, lines):
-          return
+            return
+        if self.naive_failure(code, lines):
+            return
         if code != "354":
-          self.finished(InvalidResponseCode(message="Invalid DATA response",
-                                            code=code, data=lines))
-          return
+            self.finished(InvalidResponseCode(message="Invalid DATA response",
+                                              code=code, data=lines))
+            return
+        # Notify the controller that we got the response.
+        self.ready(None)
+        
+        # Get ready for the response ot the data being finished.
         self.state = self.DATA
-        self.statfuture = asyncio.futures.Future()
-        return self.statfuture
+        self.next_state = self.data_done_response
     
     # So named because we assume the data is already transparent.
     # XXX:
@@ -753,14 +932,15 @@ class client(_crlfprotocol):
         self.transport.write(data)
         return
 
-    def data_done_response(self, data):
-      if self.statfuture != None:
+    def data_done_response(self, code, lines):
+      if self.statfuture == None:
         return
-      if self.naivefailure(code, lines):
+      if self.naive_failure(code, lines):
         return
       if code != "250":
           self.finished(InvalidResponseCode(message="Invalid DATA response",
                                             code=code, data=lines))
+      self.ready(None)
 
     def shutdown(self, data):
         return self.send_command("QUIT", self.quit_response)

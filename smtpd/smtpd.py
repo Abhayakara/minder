@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 
+import dns.resolver
+import dns.rdatatype
+# This shouldn't be necessary, but for some reason __import__ when
+# called from a coroutine, doesn't always work, and I haven't been
+# able to figure out why.   Possibly this is a 3.4.0 bug that's fixed
+# later, but googling for it hasn't worked.
+import dns.rdtypes.ANY.MX
+import dns.rdtypes.IN.A
+import dns.rdtypes.IN.AAAA
+import dns.rdtypes.ANY.SOA
+import dns.rdtypes.ANY.NS
 import smtp
 import ssl as tls
 import asyncio
@@ -124,7 +135,7 @@ class userdb(coldb):
     # up in the mailbox of the user who validated is a valid
     # outgoing email address for that user.
     if chash == hash[:32]:
-      return udata["mbox"]
+      return udata
     return None
 
   def process_fields(self, fields):
@@ -202,36 +213,44 @@ class userdb(coldb):
 class msmtp(smtp.server):
   userdb = None
   mailbox = None
+  connections = {}
+  connection_list = []
 
   # If we are authenticated, make sure the mail is from
   # the authenticated user; if not, make sure that the
   # sender passes basic anti-spam checks.
   def validate_mailfrom(self, address):
     if self.authenticated:
-      return validate_fromuser(self, address)
+      return self.validate_fromuser(address)
     else:
-      return validate_sender(self, address)
+      return self.validate_sender(address)
 
   def validate_sender(self, address):
     # Add sender validation fu here:
     return True
 
+  @asyncio.coroutine
   def validate_fromuser(self, address):
+    addr = self.userdb.parse_address(address)
+
     # First just check that it's a valid local address
-    if not self.validate_mailbox(address):
+    if not self.validate_mailbox(addr):
       return False
     
     # Now check to see if the address delivers to the
     # specified mailbox, which should be the mailbox
     # of the authenticated user.
-    addr = self.userdb.parse_address(address)
     slot = self.userdb.find_slot(addr)
     if (self.mailbox != None and self.authenticated and
         slot["mbox"] == self.mailbox):
+      self.mail_from = address
+      self.from_domain = addr[1]
       return True
+    self.push("550 Not authorized.")
     return False
 
   def validate_rcptto(self, address):
+    print("validate_rcptto:", address)
     udbaddr = self.userdb.parse_address(address)
     if udbaddr == None:
       self.push("501 Syntax: RCPT TO: <address>")
@@ -239,30 +258,46 @@ class msmtp(smtp.server):
       return False
     
     if self.authenticated:
+      print("validate_recipient")
       return self.validate_recipient(udbaddr[0], udbaddr[1])
+
     else:
+      print("validate mailbox")
       return self.validate_mailbox(udbaddr)
       
   # Do the A and AAAA queries in parallel.
-  def fetch_addrs(self, name, arecs, a4recs):
+  @asyncio.coroutine
+  def fetch_addrs(self, resolver, name, arecs, a4recs):
     aco = resolver.aquery(name, "A", raise_on_no_answer=False)
     a4co = resolver.aquery(name, "AAAA", raise_on_no_answer=False)
-    co = asyncio.gather([aco, a4co])
+    co = asyncio.gather(aco, a4co)
     (aans, a4ans) = yield from co
-    for rdata in aans:
-      arecs.append(rdata.address)
-    for rdata in a4ans:
-      a4recs.append(rdata.address)
+    if aans.rrset != None:
+      print("aans:", repr(aans))
+      for rdata in aans:
+        arecs.append(rdata.address)
+    if a4ans.rrset != None:
+      print("a4ans:", repr(a4ans))
+      for rdata in a4ans:
+        a4recs.append(rdata.address)
     
   # Do all the MX fiddling to get a connection to the specified domain
   # if we don't already have one.
   @asyncio.coroutine
-  def get_connection(self, domain):
+  def get_connection(self, user, domain):
     # We're already connected.   Just return the connection.
     if domain in self.connections:
+      connection = self.connections[domain]
+      if self.connections[domain] not in self.connection_list:
+        status = yield from self.send_rcptto(connection, user + "@" + domain)
+
+        if status:
+          self.connections[user + "@" + domain] = connection
+          self.connection_list.append(connection)
+        return status
       return True
     
-    resolver = dns.resolver.resolver()
+    resolver = dns.resolver.Resolver()
     resolver.use_edns(0, 0, 1410)
     mxs = {}
     answer = None
@@ -270,15 +305,15 @@ class msmtp(smtp.server):
     try:
       answer = yield from resolver.aquery(domain, "MX")
       
-    except NoAnswer:
+    except dns.resolver.NoAnswer:
       # No answer means there's no MX record, so look for an A or
       # AAAA record.
       arecs = []
       a4recs = []
-      self.fetch_addrs(domain, arecs, a4recs)
+      yield from self.fetch_addrs(resolver, domain, arecs, a4recs)
       if len(arecs) > 0 or len(a4recs) > 0:
-        mxs = { 0: { "exchange" : domain,
-                     "a": arecs, "aaaa": a4recs } }
+        mxs = { 0: [ { "exchange" : domain,
+                       "a": arecs, "aaaa": a4recs } ] }
         addressable = True
 
     except NXDOMAIN:
@@ -295,27 +330,30 @@ class msmtp(smtp.server):
 
     else:
       for mx in answer:
-        arecs = []
-        a4recs = []
-        # If exchange addresses were included in the additional
-        # section, use those.
-        for rdata in answer.response.additional:
-          if rdata.name == mx.exchange:
-            if rdata.type == dns.rdatatype.A:
-              arecs.append(rdata.address)
-            elif rdata.type == dns.rdatatype.AAAA:
-              a4recs.append(rdata.address)
-        # Otherwise, fetch A and/or AAAA records for exchange
-        if len(arecs) == 0 and len(a4recs) == 0:
-          self.fetch_addrs(mx.exchange, arecs, a4recs)
-        if len(arecs) > 0 or len(a4recs) > 0:
-          entry = { "exchange": mx.exchange,
-                    "a": arecs, "aaaa": a4recs}
-          if mx.preference in mxs:
-            mxs[mx.preference].append(entry)
-          else:
-            mxs[mx.preference] = [entry]
-          addressable = True
+        if mx.rdtype == dns.rdatatype.MX:
+          arecs = []
+          a4recs = []
+          # If exchange addresses were included in the additional
+          # section, use those.
+          for rrset in answer.response.additional:
+            if rrset.name == mx.exchange:
+              if rrset.rdtype == dns.rdatatype.A:
+                for rdata in rrset:
+                  arecs.append(rdata.address)
+              elif rrset.rdtype == dns.rdatatype.AAAA:
+                for rdata in rrset:
+                  a4recs.append(rdata.address)
+          # Otherwise, fetch A and/or AAAA records for exchange
+          if len(arecs) == 0 and len(a4recs) == 0:
+            yield from self.fetch_addrs(resolver, mx.exchange, arecs, a4recs)
+          if len(arecs) > 0 or len(a4recs) > 0:
+            entry = { "exchange": mx.exchange,
+                      "a": arecs, "aaaa": a4recs}
+            if mx.preference in mxs:
+              mxs[mx.preference].append(entry)
+            else:
+              mxs[mx.preference] = [entry]
+            addressable = True
 
     # If we didn't get a single server IP address either out of the
     # MX query chain or the A/AAAA query on the name if there was no
@@ -336,7 +374,7 @@ class msmtp(smtp.server):
     # same preference, one exchange at a time.
 
     addrs = []
-    preferences = list(keys(mxs))
+    preferences = list(mxs.keys())
     preferences.sort()
     # Iterate across preference levels
     for pref in preferences:
@@ -363,74 +401,119 @@ class msmtp(smtp.server):
     # the first connection that completes, dropping the others.
     # It should be rare that a connection takes longer than five
     # seconds to complete if the exchange is reachable.
+    connection = yield from self.connect_to_addresses(addrs, 5)
+
+    if connection != None:
+      status = yield from self.send_rcptto(connection, user + "@" + domain)
+
+      if status:
+        self.connections[user + "@" + domain] = connection
+        self.connections[domain] = connection
+        self.connection_list.append(connection)
+      return status
+    return False
+
+  @asyncio.coroutine
+  def send_rcptto(self, connection, mailbox):
+    # Identify the sender of the current transaction.
     try:
-      connection = self.connect_to_addresses(addrs, 5,
-					     self.initialize_connection)
-    except smtp.TemporaryFailure as x:
-      # Temporary failure; we just have to stash the message for this
-      # address.
-      self.connections[user + "@" + domain] = None
-      self.connections[domain] = None
-      return True
-    except smtp.PermanentFailure as x:
-      self.push("550 " + str(x))
-      # Remember the exception in case there's another RCPT TO:
-      # for this domain.
+      yield from connection.mail_from(self.mail_from)
+    except Exception as x:
       self.connections[user + "@" + domain] = x
       self.connections[domain] = x
-    self.connections[user + "@" + domain] = connection
-    self.connections[domain] = connection
+      self.push_exception_result(x)
+      return False
     return True
 
   @asyncio.coroutine
-  def connect_to_addresses(self, addresses, interval, initialize):
+  def connect_to_addresses(self, addresses, interval):
     tasks = []
     client_futs = []
+    greet_futs = []
     connection = None
 
-    # Loop through the addresses, starting a connection to the next
-    # one every _interval_ seconds.   When we have a connection,
-    # wait for it to become ready.
-    for (address, family, name) in addresses:
-      print("Connecting to", name, "at", address)
-      co = asyncio.create_connection(smtp.client, host=address, port=25, family=family)
-      task = asyncio.ensure_future(co)
-      tasks.append(task)
-      alltasks = tasks.copy().extend(client_futs)
-      co2 = asyncio.wait(alltasks, timeout=interval, return_when=concurrent.futures.FIRST_COMPLETED)
-      # Wait up to _interval_ seconds for this task or any task created in a
-      # previous iteration to complete.
-      (complete, pending) = yield from co2
+    def process_completions(complete, pending):
+      connection = None
       # if any tasks completed, try to establish a conversation on the
       # corresponding socket.
       for task in complete:
         # If the future was cancelled, it was by something at a higher
         # level, so we should just stop.
         if task.cancelled():
-          return
+          return None
         # If we didn't get an exception, then we should have a connected
         # socket.
         if task.exception() == None:
           if task in tasks:
             (transport, client) = task.result()
             fut = client.is_ready()
-            if fut == None:
-              connection = client
+            if fut == None: # unlikely
+              fut = client.hello(self.from_domain)
+              greet_futs.append(fut)
             else:
               client_futs.append(fut)
           elif task in client_futs:
+            client = task.result()
+            fut = client.hello(self.from_domain)
+            if fut == None: # really unlikely
+              connection = client
+              print("future returned connection: ", repr(connection))
+            else:
+              greet_futs.append(fut)
+          elif task in greet_futs:
             connection = task.result()
           else:
-            print("Weird: %s completed but not in %s or %s" % (task, tasks, client_futs))
+            print("Weird: %s completed but not in %s or %s" %
+                  (task, tasks, client_futs))
         if task in tasks:
           tasks.remove(task)
-        else:
+        elif task in client_futs:
           client_futs.remove(task)
+        else:
+          greet_futs.remove(task)
         if connection != None:
           break
-            
-    # Identify the sender of the current transaction.
-    yield from connection.mail_from(self.mail_from)
+      return connection
+    
+    # Loop through the addresses, starting a connection to the next
+    # one every _interval_ seconds.   When we have a connection,
+    # wait for it to become ready.
+    for (address, family, name) in addresses:
+      print("Connecting to", name, "at", address)
+      loop = asyncio.get_event_loop()
+      co = loop.create_connection(smtp.client,
+                                  host=address, port=25, family=family)
+      task = asyncio.async(co)
+      tasks.append(task)
+      alltasks = tasks.copy()
+      alltasks.extend(client_futs)
+      alltasks.extend(greet_futs)
+      co2 = asyncio.wait(alltasks,
+                         timeout=interval, return_when=FIRST_COMPLETED)
+
+      # Wait up to _interval_ seconds for this task or any task created in a
+      # previous iteration to complete.
+      (complete, pending) = yield from co2
+      connection = process_completions(complete, pending)
+
+    # At this point if we don't have a connection, but still have pending
+    # tasks, wait up to an additional _interval_ seconds for one of them to
+    # cough up a connection.
+    if connection == None:
+      alltasks = tasks.copy()
+      alltasks.extend(client_futs)
+      alltasks.extend(greet_futs)
+      if len(alltasks) > 0:
+        co2 = asyncio.wait(alltasks,
+                           timeout=interval, return_when=FIRST_COMPLETED)
+        (complete, pending) = yield from co2
+        connection = process_completions(complete, pending)
+        for task in pending:
+          task.cancel()
+
+      # Still nothing.   Too bad.
+      if connection == None:
+        return None
     return connection
 
   # In validate_recipient, we actually try to connect to the mail
@@ -450,37 +533,148 @@ class msmtp(smtp.server):
   # be necessary in most cases.
   @asyncio.coroutine
   def validate_recipient(self, user, domain):
-    # If we get a False back from get_connection, it means we
-    # invalidated the sender and sent a 550 response.
-    if not (yield from self.get_connection(domain)):
+    # If we get a False back from get_connection, it means that
+    # this mailbox will not accept mail from this sender.
+    if not (yield from self.get_connection(user, domain)):
+      print("get_connection(%s) returned false" % domain)
       return False
-
+    
     # Otherwise, see if there's a connection.   There will either
     # be a connection or None for this domain.
     connection = self.connections[domain]
+    print("connection is ", repr(connection))
 
     # None means that we weren't able to connect because of a
     # temporary failure, which means we have to assume the address
     # is valid and try to deliver it later, generating a bounce if
     # worse comes to worst.
     if connection == None:
-      return True
+      #self.push("250 Ok.")
+      self.push("450 Mailbox temporarily inaccessible; try later.")
+      return False
     
-    return (yield from connection.send_rcpt_to(user + "@" + domain))
+    try:
+      result = yield from connection.rcpt_to(user + "@" + domain)
+    except (self.PermanentFailure, self.TemporaryFailure) as x:
+      for line in x.response():
+        self.push(line)
+      return False
+    except Exception as x:
+      self.push("451 " + str(x))
+      return False
+    return True
     
   def validate_mailbox(self, address):
     if not self.userdb.validate_domain(address):
       self.push('551 Not a local domain, relaying not available.')
       syslog.syslog(syslog.LOG_INFO,
-		    "551 Invalid domain: RCPT TO: %s@%s" % address)
+		    "551 Invalid domain: RCPT TO: %s@%s" % tuple(address))
       return False
 
     if not self.userdb.validate_address(address):
       self.push("550 Mailbox unavailable.")
       syslog.syslog(syslog.LOG_INFO,
-		    "550 Invalid mailbox: RCPT TO: %s@%s" % address)
+		    "550 Invalid mailbox: RCPT TO: %s@%s" % tuple(address))
       return False
     return True
+
+  def data_mode(self):
+    # If we aren't acting as a maildrop server, just accept the message.
+    if not self.authenticated:
+      return False
+    co = self.start_data_tunnel()
+    asyncio.async(co)
+    # Returning true means we're responsible for sending 354 when
+    # we are ready.
+    return True
+
+  @asyncio.coroutine
+  def start_data_tunnel(self):
+    if len(self.connection_list) == 0:
+      self.push("451 not ready for some reason.")
+      return
+    waits = []
+    if len(self.connection_list) == 0:
+      self.push("451 no connections.")
+      
+    for connection in self.connection_list:
+      print(repr(connection))
+      fut = connection.data()
+      waits.append(fut)
+    while len(waits) > 0:
+      (complete, waits) = yield from asyncio.wait(waits)
+      for task in complete:
+        print("data task completed")
+        x = task.exception()
+        if x != None:
+          self.push_exception_result(x)
+          return
+    self.chunk_state = None
+    self.line_oriented = False
+    self.push("354 On my mark, En-gage...")
+    return
+
+    def push_exception_result(self, exception):
+      if (isinstance(x, smtp.TemporaryFailure) or
+          isinstance(x, smtp.PermanentFailure)):
+        for line in x.response():
+          self.push(line)
+      else:
+        self.push("451 kabplui!")
+
+  # When we are receiving data as a maildrop, we just receive it as chunks
+  # and send it to all of the connections without processing.   We do, however,
+  # look for the \r\n.\r\n sequence so that we know when we are done.
+  # There is no guarantee that this will not be broken across two chunks,
+  # so this is harder than it might seem at first, although not _hard_.
+  def process_chunk(self, chunk):
+    resid = None
+    done = False
+    eod = b"\r\n.\r\n"
+    if self.chunk_state != None:
+      chunk = self.chunk_state + chunk
+      self.chunk_state = None
+    offset = chunk.find(eod)
+    if offset == -1:
+      for i in range(min(len(chunk), len(eod) - 1), 0, -1):
+        if chunk.endswith(eod[0:i]):
+          self.chunk_state = chunk[-i:]
+          chunk = chunk[0:-i]
+          break
+    else:
+      if offset + len(eod) != len(chunk):
+        resid = chunk[offset+len(eod):]
+        chunk = chunk[0:offset + len(eod)]
+      self.line_oriented = True
+      self.chunk_state = None
+      # Wait for data confirmations and then send the acknowledgement
+      co = self.await_data_confirmations()
+      asyncio.async(co)
+    for connection in self.connection_list:
+      connection.send_transparent_data(chunk)
+    return resid
+
+  @asyncio.coroutine
+  def await_data_confirmations(self):
+    futs = []
+    for connection in self.connection_list:
+      fut = connection.is_ready()
+      if fut != None:
+        futs.append(fut)
+    while len(futs) > 0:
+      (done, futs) = yield from asyncio.wait(futs)
+      for fut in done:
+        x = fut.exception()
+        if x != None:
+          self.push_exception_result(x)
+          return
+    self.connection_list = []
+    self.rcpttos = []
+    self.mailfrom = None
+    self.smtp_state = self.COMMAND
+    self.num_data_bytes = 0
+    self.received_lines = []
+    self.push("250 Message Accepted.")
 
   def process_message(self, peer, mailfrom, rcpttos, data):
     syslog.syslog(syslog.LOG_INFO, "Mail from %s via %s" % (mailfrom, peer[0]))
@@ -519,7 +713,14 @@ class msmtp(smtp.server):
       return False
     self.mailbox = slot['mbox']
     return True
-  
+
+  def reset(self):
+    for connection in self.connection_list:
+      connection.shutdown()
+
+  def closed(self):
+    self.reset()
+
 # Open debugging and logging while we still can.
 debug = open("/var/log/smtpd.debug", "a")
 syslog.openlog(facility=syslog.LOG_MAIL)
@@ -543,9 +744,12 @@ except:
 loop = asyncio.get_event_loop()
 
 # Create a listener...
-coroutine = loop.create_server(msmtp, "localhost", 587, family=socket.AF_INET,
-                               ssl=tlsctx, backlog=5, reuse_address=True)
-tlsserver = loop.run_until_complete(coroutine)
+maildrop_port = loop.create_server(msmtp, "::1", 587, family=socket.AF_INET6,
+                                   ssl=tlsctx, backlog=5, reuse_address=True)
+smtp_port = loop.create_server(msmtp, "::", 25, family=socket.AF_INET6,
+                               ssl=None, backlog=5, reuse_address=True)
+servers = asyncio.gather(maildrop_port, smtp_port)
+(maildrop_server, smtp_server) = loop.run_until_complete(servers)
 
 # XXX fork, close listen socket, chroot, setuid
 os.chroot(mindhome)
@@ -559,6 +763,8 @@ except KeyboardInterrupt:
   pass
 
 # Close the server
-tlsserver.close()
+maildrop_server.close()
 loop.run_until_complete(tlsserver.wait_closed())
+smtp_server.close()
+loop.run_until_complete(smtp_server.wait_closed())
 loop.close()
