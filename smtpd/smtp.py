@@ -666,7 +666,7 @@ class server(_crlfprotocol):
         username = None
         password = None
         try:
-            (username, password) = data.split(b"\x00")
+            (authzid, authcid, password) = data.split(b"\x00")
         except Exception as e:
             self.push("501 invalid authentication data: %s" % str(e))
             print("data: ", data)
@@ -678,9 +678,9 @@ class server(_crlfprotocol):
         # along with that, so we can't just call it at random
         # in situations where we don't want that state to come into
         # being.
-        if self.authenticate(username, password):
+        if self.authenticate(authcid, password):
             self.authenticated = True
-            self.authenticated_user = username
+            self.authenticated_user = authcid
             self.push("235 Authenticated.")
         else:
             self.push("535 Invalid credentials.")
@@ -751,7 +751,7 @@ class client(_crlfprotocol):
         elif self.state == self.READY:
             # Shouldn't be getting input in this state because
             # we haven't said anything.
-            self.finished(UnexpectedInput(line))
+            self.finished(InvalidState(line))
             return
         else:
             self.push('451 Internal confusion')
@@ -849,8 +849,11 @@ class client(_crlfprotocol):
             print("Entered ready but not in READY state.")
         print("ready.")
         if self.statfuture != None:
-            self.statfuture.set_result(self)
-            self.statfuture = None
+            if self.statfuture.cancelled():
+                print("canceled:", repr(self.peer))
+            else:
+                self.statfuture.set_result(self)
+                self.statfuture = None
         return rv
 
     def mail_from(self, address):
@@ -859,7 +862,8 @@ class client(_crlfprotocol):
 
     def send_command(self, command, response_callback):
         if self.state != self.READY:
-            raise InvalidState("Not ready to send a new command.")
+            raise InvalidState("Not ready to send a new command: " +
+                               str(self.state))
         self.state = self.WAITING
         self.next_state = response_callback
         self.push(command)
@@ -933,6 +937,7 @@ class client(_crlfprotocol):
         return
 
     def data_done_response(self, code, lines):
+      self.state = self.READY
       if self.statfuture == None:
         return
       if self.naive_failure(code, lines):
@@ -942,7 +947,8 @@ class client(_crlfprotocol):
                                             code=code, data=lines))
       self.ready(None)
 
-    def shutdown(self, data):
+    def shutdown(self):
+        print("shutdown:", self.peer)
         return self.send_command("QUIT", self.quit_response)
 
     def quit_response(self, code, lines):

@@ -21,6 +21,7 @@ import pwd
 import socket
 import base64
 import hashlib
+import time
 
 import mailbox
 import email
@@ -68,11 +69,10 @@ class tlsconf(coldb):
     # Once STARTTLS support is implemented, we could allow
     # maildrops only on the TLS port (465), and reject maildrops on
     # the main port (25) and the STARTTLS port (587).
-    self.tlsctx = tls.SSLContext(tls.PROTOCOL_TLSv1)
+    self.tlsctx = tls.SSLContext(tls.PROTOCOL_SSLv23)
     self.tlsctx.options = (tls.OP_NO_COMPRESSION | tls.OP_SINGLE_DH_USE |
                            tls.OP_SINGLE_ECDH_USE |
-                           tls.OP_CIPHER_SERVER_PREFERENCE |
-                           tls.OP_NO_SSLv2 | tls.OP_NO_SSLv3 | tls.OP_NO_TLSv1)
+                           tls.OP_NO_SSLv2 | tls.OP_NO_SSLv3)
     self.tlsctx.verify_mode = tls.CERT_NONE # we don't want client certs
     self.tlsctx.set_ciphers("ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:" +
                             "ECDH+AES128:DH+AES:ECDH+3DES:DH+3DES:" +
@@ -235,6 +235,7 @@ class msmtp(smtp.server):
 
     # First just check that it's a valid local address
     if not self.validate_mailbox(addr):
+      print("not a local address: ", repr(addr))
       return False
     
     # Now check to see if the address delivers to the
@@ -273,11 +274,9 @@ class msmtp(smtp.server):
     co = asyncio.gather(aco, a4co)
     (aans, a4ans) = yield from co
     if aans.rrset != None:
-      print("aans:", repr(aans))
       for rdata in aans:
         arecs.append(rdata.address)
     if a4ans.rrset != None:
-      print("a4ans:", repr(a4ans))
       for rdata in a4ans:
         a4recs.append(rdata.address)
     
@@ -294,6 +293,8 @@ class msmtp(smtp.server):
         if status:
           self.connections[user + "@" + domain] = connection
           self.connection_list.append(connection)
+        else:
+          print("bad status after send_rcptto.")
         return status
       return True
     
@@ -319,6 +320,7 @@ class msmtp(smtp.server):
     except NXDOMAIN:
       self.push("550 no such domain.")
       syslog.syslog(syslog.LOG_INFO, "550 no such domain: %s" % domain)
+      print("550 no such domain: %s" % domain)
       return False
 
     except:
@@ -362,6 +364,7 @@ class msmtp(smtp.server):
       self.push("550 no exchanger or addresses for domain.")
       syslog.syslog(syslog.LOG_INFO,
                     "550 no exchanger or addresses for: %s" % domain)
+      print("550 no exchanger or addresses for: %s" % domain)
       return False
           
     # Our task now is to get a connection to the most preferable
@@ -410,7 +413,10 @@ class msmtp(smtp.server):
         self.connections[user + "@" + domain] = connection
         self.connections[domain] = connection
         self.connection_list.append(connection)
+      else:
+        print("horked in send_rcptto")
       return status
+    print("no connection returned.")
     return False
 
   @asyncio.coroutine
@@ -418,10 +424,12 @@ class msmtp(smtp.server):
     # Identify the sender of the current transaction.
     try:
       yield from connection.mail_from(self.mail_from)
+      print("sent rcpt_to")
     except Exception as x:
       self.connections[user + "@" + domain] = x
       self.connections[domain] = x
       self.push_exception_result(x)
+      print("connection.mail_from borked:", str(x))
       return False
     return True
 
@@ -432,46 +440,68 @@ class msmtp(smtp.server):
     greet_futs = []
     connection = None
 
-    def process_completions(complete, pending):
+    @asyncio.coroutine
+    def process_completions(timeout):
       connection = None
-      # if any tasks completed, try to establish a conversation on the
-      # corresponding socket.
-      for task in complete:
-        # If the future was cancelled, it was by something at a higher
-        # level, so we should just stop.
-        if task.cancelled():
-          return None
-        # If we didn't get an exception, then we should have a connected
-        # socket.
-        if task.exception() == None:
-          if task in tasks:
-            (transport, client) = task.result()
-            fut = client.is_ready()
-            if fut == None: # unlikely
+      while connection == None and (len(tasks) > 0 or
+                                    len(client_futs) > 0 or
+                                    len(greet_futs) > 0):
+        # Figure out how much time to wait, wait at least a
+        # bit.
+        remaining = timeout - time.time()
+        if remaining < 0:
+          remaining = 0.1
+
+        alltasks = tasks.copy()
+        alltasks.extend(client_futs)
+        alltasks.extend(greet_futs)
+        co2 = asyncio.wait(alltasks,
+                           timeout=interval, return_when=FIRST_COMPLETED)
+
+        # Wait up to _interval_ seconds for this task or any task created in a
+        # previous iteration to complete.
+        (complete, pending) = yield from co2
+
+        # if any tasks completed, try to establish a conversation on the
+        # corresponding socket.
+        for task in complete:
+          # If the future was cancelled, it was by something at a higher
+          # level, so we should just stop.
+          if task.cancelled():
+            return None
+          # If we didn't get an exception, then we should have a connected
+          # socket.
+          if task.exception() == None:
+            if task in tasks:
+              (transport, client) = task.result()
+              fut = client.is_ready()
+              if fut == None: # unlikely
+                fut = client.hello(self.from_domain)
+                greet_futs.append(fut)
+              else:
+                client_futs.append(fut)
+            elif task in client_futs:
+              client = task.result()
               fut = client.hello(self.from_domain)
-              greet_futs.append(fut)
+              if fut == None: # really unlikely
+                connection = client
+              else:
+                greet_futs.append(fut)
+            elif task in greet_futs:
+              connection = task.result()
             else:
-              client_futs.append(fut)
+              print("Weird: %s completed but not in %s or %s" %
+                    (task, tasks, client_futs))
+          if task in tasks:
+            tasks.remove(task)
           elif task in client_futs:
-            client = task.result()
-            fut = client.hello(self.from_domain)
-            if fut == None: # really unlikely
-              connection = client
-              print("future returned connection: ", repr(connection))
-            else:
-              greet_futs.append(fut)
-          elif task in greet_futs:
-            connection = task.result()
+            client_futs.remove(task)
           else:
-            print("Weird: %s completed but not in %s or %s" %
-                  (task, tasks, client_futs))
-        if task in tasks:
-          tasks.remove(task)
-        elif task in client_futs:
-          client_futs.remove(task)
-        else:
-          greet_futs.remove(task)
-        if connection != None:
+            greet_futs.remove(task)
+          if connection != None:
+            break
+
+        if timeout <= time.time():
           break
       return connection
     
@@ -485,35 +515,27 @@ class msmtp(smtp.server):
                                   host=address, port=25, family=family)
       task = asyncio.async(co)
       tasks.append(task)
-      alltasks = tasks.copy()
-      alltasks.extend(client_futs)
-      alltasks.extend(greet_futs)
-      co2 = asyncio.wait(alltasks,
-                         timeout=interval, return_when=FIRST_COMPLETED)
-
-      # Wait up to _interval_ seconds for this task or any task created in a
-      # previous iteration to complete.
-      (complete, pending) = yield from co2
-      connection = process_completions(complete, pending)
+      connection = yield from process_completions(time.time() + interval)
+      if connection:
+        break
 
     # At this point if we don't have a connection, but still have pending
     # tasks, wait up to an additional _interval_ seconds for one of them to
     # cough up a connection.
     if connection == None:
-      alltasks = tasks.copy()
-      alltasks.extend(client_futs)
-      alltasks.extend(greet_futs)
-      if len(alltasks) > 0:
-        co2 = asyncio.wait(alltasks,
-                           timeout=interval, return_when=FIRST_COMPLETED)
-        (complete, pending) = yield from co2
-        connection = process_completions(complete, pending)
-        for task in pending:
-          task.cancel()
+      connection = yield from process_completions(time.time() + interval)
+      for task in tasks:
+        task.cancel()
+      for task in client_futs:
+        task.cancel()
+      for task in greet_futs:
+        task.cancel()
 
       # Still nothing.   Too bad.
       if connection == None:
         return None
+    if connection != None:
+      print("Connected to:", repr(connection.peer))
     return connection
 
   # In validate_recipient, we actually try to connect to the mail
@@ -536,13 +558,11 @@ class msmtp(smtp.server):
     # If we get a False back from get_connection, it means that
     # this mailbox will not accept mail from this sender.
     if not (yield from self.get_connection(user, domain)):
-      print("get_connection(%s) returned false" % domain)
       return False
     
     # Otherwise, see if there's a connection.   There will either
     # be a connection or None for this domain.
     connection = self.connections[domain]
-    print("connection is ", repr(connection))
 
     # None means that we weren't able to connect because of a
     # temporary failure, which means we have to assume the address
@@ -555,7 +575,7 @@ class msmtp(smtp.server):
     
     try:
       result = yield from connection.rcpt_to(user + "@" + domain)
-    except (self.PermanentFailure, self.TemporaryFailure) as x:
+    except (smtp.PermanentFailure, smtp.TemporaryFailure) as x:
       for line in x.response():
         self.push(line)
       return False
@@ -604,7 +624,6 @@ class msmtp(smtp.server):
     while len(waits) > 0:
       (complete, waits) = yield from asyncio.wait(waits)
       for task in complete:
-        print("data task completed")
         x = task.exception()
         if x != None:
           self.push_exception_result(x)
@@ -614,13 +633,13 @@ class msmtp(smtp.server):
     self.push("354 On my mark, En-gage...")
     return
 
-    def push_exception_result(self, exception):
-      if (isinstance(x, smtp.TemporaryFailure) or
-          isinstance(x, smtp.PermanentFailure)):
-        for line in x.response():
-          self.push(line)
-      else:
-        self.push("451 kabplui!")
+  def push_exception_result(self, x):
+    if (isinstance(x, smtp.TemporaryFailure) or
+        isinstance(x, smtp.PermanentFailure)):
+      for line in x.response():
+        self.push(line)
+    else:
+      self.push("451 kabplui!")
 
   # When we are receiving data as a maildrop, we just receive it as chunks
   # and send it to all of the connections without processing.   We do, however,
@@ -668,7 +687,7 @@ class msmtp(smtp.server):
         if x != None:
           self.push_exception_result(x)
           return
-    self.connection_list = []
+    self.reset()
     self.rcpttos = []
     self.mailfrom = None
     self.smtp_state = self.COMMAND
@@ -715,8 +734,12 @@ class msmtp(smtp.server):
     return True
 
   def reset(self):
-    for connection in self.connection_list:
-      connection.shutdown()
+    connections = self.connections
+    self.connections = {}
+    self.connection_list = []
+    for domain in connections:
+      if "@" not in domain:
+        connections[domain].shutdown()
 
   def closed(self):
     self.reset()
@@ -733,23 +756,22 @@ minder_uent = pwd.getpwnam("minder")
 minder_user = minder_uent.pw_uid
 
 # Load the TLS certs...
-tlsctx = None
-try:
-  tlscf = tlsconf()
-  tlsctx = tlscf.tlsctx
-except:
-  pass
+tlscf = tlsconf()
+tlsctx = tlscf.tlsctx
 
 # Get the vent loop...
 loop = asyncio.get_event_loop()
 
 # Create a listener...
-maildrop_port = loop.create_server(msmtp, "::1", 587, family=socket.AF_INET6,
-                                   ssl=tlsctx, backlog=5, reuse_address=True)
-smtp_port = loop.create_server(msmtp, "::", 25, family=socket.AF_INET6,
-                               ssl=None, backlog=5, reuse_address=True)
-servers = asyncio.gather(maildrop_port, smtp_port)
-(maildrop_server, smtp_server) = loop.run_until_complete(servers)
+maildrop_ports = []
+maildrop_ports.append(loop.create_server(msmtp, "::", 465,
+                      family=socket.AF_INET6,
+                      ssl=tlsctx, backlog=5, reuse_address=True))
+maildrop_ports.append(loop.create_server(msmtp, "0.0.0.0", 465,
+                      family=socket.AF_INET,
+                      ssl=tlsctx, backlog=5, reuse_address=True))
+servers = asyncio.gather(*maildrop_ports)
+maildrop_servers = loop.run_until_complete(servers)
 
 # XXX fork, close listen socket, chroot, setuid
 os.chroot(mindhome)
@@ -763,8 +785,7 @@ except KeyboardInterrupt:
   pass
 
 # Close the server
-maildrop_server.close()
-loop.run_until_complete(tlsserver.wait_closed())
-smtp_server.close()
-loop.run_until_complete(smtp_server.wait_closed())
+for server in maildrop_servers:
+  server.close()
+  loop.run_until_complete(server.wait_closed())
 loop.close()
