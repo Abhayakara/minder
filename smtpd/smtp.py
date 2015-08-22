@@ -724,9 +724,8 @@ class client(_crlfprotocol):
         self.received_lines = []
         self.state = self.WAITING
 
-    # The controller needs to wait for the greeting to happen,
-    # and for data acknowledgment to come back.  is_ready provides
-    # a point of intercession
+    # The controller needs to wait for the greeting to happen.
+    # is_ready provides a point of intercession
     def is_ready(self):
         if self.state == self.READY:
             # In this case we managed to get the greeting
@@ -935,6 +934,16 @@ class client(_crlfprotocol):
     def send_transparent_data(self, data):
         self.transport.write(data)
         return
+
+    # Wait for the data response.
+    def await_data_response(self, message):
+        if self.state == self.READY:
+            # This should never happen because the caller
+            # always calls await_data_response before sending
+            # the last (possibly also first) hunk of data.
+            return None
+        self.statfuture = asyncio.futures.Future()
+        return self.statfuture        
 
     def data_done_response(self, code, lines):
       self.state = self.READY

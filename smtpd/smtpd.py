@@ -215,6 +215,7 @@ class msmtp(smtp.server):
   mailbox = None
   connections = {}
   connection_list = []
+  message = None
 
   # If we are authenticated, make sure the mail is from
   # the authenticated user; if not, make sure that the
@@ -649,21 +650,30 @@ class msmtp(smtp.server):
   def process_chunk(self, chunk):
     resid = None
     done = False
-    eod = b"\r\n.\r\n"
-    if self.chunk_state != None:
-      chunk = self.chunk_state + chunk
-      self.chunk_state = None
-    offset = chunk.find(eod)
-    if offset == -1:
-      for i in range(min(len(chunk), len(eod) - 1), 0, -1):
-        if chunk.endswith(eod[0:i]):
-          self.chunk_state = chunk[-i:]
-          chunk = chunk[0:-i]
-          break
+    eom = b"\r\n.\r\n"
+    if self.message != None:
+      self.message = self.message + chunk
     else:
-      if offset + len(eod) != len(chunk):
-        resid = chunk[offset+len(eod):]
-        chunk = chunk[0:offset + len(eod)]
+      self.message = chunk
+      self.eom_search_start = 0
+    # Just search the portion of the message we haven't already searched for
+    # the eom tag.
+    offset = chunk.find(eom, self.eom_search_start)
+    # If we didn't find the eom tag, see if there is text at the end of the
+    # message that could be part of the EOM; if so, set eom_search_start
+    # to the beginning of that text.
+    if offset == -1:
+      eom_offset = 0
+      for i in range(min(len(chunk), len(eom) - 1), 0, -1):
+        if chunk.endswith(eom[0:i]):
+          eom_offset = i
+          break
+      self.eom_search_start = self.eom_search_start + len(chunk) - eom_offset
+    else:
+      if offset + len(eom) != len(chunk):
+        resid = chunk[offset+len(eom):]
+        chunk = chunk[0:offset + len(eom)]
+        self.message = self.message + chunk
       self.line_oriented = True
       self.chunk_state = None
       # Wait for data confirmations and then send the acknowledgement
@@ -677,7 +687,7 @@ class msmtp(smtp.server):
   def await_data_confirmations(self):
     futs = []
     for connection in self.connection_list:
-      fut = connection.is_ready()
+      fut = connection.await_data_response(self.message)
       if fut != None:
         futs.append(fut)
     while len(futs) > 0:
@@ -693,6 +703,7 @@ class msmtp(smtp.server):
     self.smtp_state = self.COMMAND
     self.num_data_bytes = 0
     self.received_lines = []
+    self.message = None
     self.push("250 Message Accepted.")
 
   def process_message(self, peer, mailfrom, rcpttos, data):
