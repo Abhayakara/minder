@@ -686,16 +686,17 @@ class server(_crlfprotocol):
             self.push("535 Invalid credentials.")
     
 class client(_crlfprotocol):
-    WAITING = 0   # waiting for a response from the server
-    DATA = 1      # In a DATA exchange
-    READY = 2     # ready to send a command to the server
+    DISCONNECTED = -1  # Our connection did not succeed.
+    CONNECTING = 0     # Waiting for connection to finish.
+    WAITING = 1        # waiting for a response from the server
+    DATA = 2           # In a DATA exchange
+    READY = 3          # ready to send a command to the server
     debugstream = Devnull()
     authenticated = False
 
-    def __init__(self):
+    def __init__(self, domain, address, family, port):
         self.data_size_limit = DATA_SIZE_DEFAULT
         self.received_lines = []
-        self.smtp_state = self.WAITING
         self.seen_greeting = ''
         self.mailfrom = None
         self.rcpttos = []
@@ -704,36 +705,58 @@ class client(_crlfprotocol):
         self.strict_newline = False
         self.statfuture = None
         self.debugstream = sys.stdout
+        self.name = name
+        self.statfuture = asyncio.futures.Future()
+        # Start connecting.
+        self.smtp_state = self.CONNECTING
+        co = loop.create_connection(lambda: client,
+                                    host=address, port=25, family=family)
+        task = asyncio.ensure_future(co)
+        # It was at this point that I realized I was programming in
+        # Javascript.   Okay, I admit it, I'm a little slow on the
+        # uptake sometimes.   KHAAAAANNNNNNNNNNNN!!!!!!!!
+        task.add_completion_callback(self.connection_finished)
+        return self
 
     def read_error(self, explanation):
         self.finished(ReadError(explanation))
+        return
 
+    # Called when the connection finishes, whether it completed
+    # (in which case connection_made will be called) or failed
+    # (in which case it won't).   asyncio.connect really ought to
+    # take a class object, not a factory, and the class object
+    # ought to 
+    def connection_finished(self, future):
+        # Presumably this means the connection failed.
+        x = future.exception()
+        if x != None:
+            if self.statfuture != None and not self.statfuture.done():
+                self.statfuture.set_exception(x)
+                self.smtp_state = DISCONNECTED
+        # there's no specification as to whether connection_made is
+        # called before or after asyncio.connect() yields its result,
+        # so we can take no action on success here, nor need we.
+        return
+        
     # We don't send anything when the connection starts--we just
     # wait for the other end to say something.
     def connection_made(self, transport):
         self.transport = transport
-        try:
-            self.peer = transport.get_extra_info("peername")
-        except OSError as err:
-            # a race condition  may occur if the other end is closing
-            # before we can get the peername
-            self.finished(err)
-            return
+        self.peer = transport.get_extra_info("peername")
         self.next_state = self.greeting
         self.repeat_code = None
         self.received_lines = []
         self.state = self.WAITING
+        return
 
+    # XXX TODO: we should just provide a future that completes when
+    # XXX       the server is ready to receive mail.   This ought to
+    # XXX       get us through greeting/HELO/EHLO/STARTTLS.  Caller
+    # XXX       should not have to know details of the protocol.
     # The controller needs to wait for the greeting to happen.
     # is_ready provides a point of intercession
     def is_ready(self):
-        if self.state == self.READY:
-            # In this case we managed to get the greeting
-            # before the controller had a chance to wait
-            # for it, so just return None to indicate
-            # that it's not necessary to wait.
-            return None
-        self.statfuture = asyncio.futures.Future()
         return self.statfuture        
 
     # Overrides base class for convenience
@@ -760,16 +783,18 @@ class client(_crlfprotocol):
 
     def parse_response_line(self, line):
         if len(line) < 4:
-            self.finished(InvalidResponseCode(message="Short response line", data = line))
+            self.finished(InvalidResponseCode(message="Short response line",
+                                              data = line))
             return
         code = line[0:3]
         more = line[3]
         text = line[4:]
         if self.repeat_code != None:
             if self.repeat_code != code:
-              self.finished(InvalidResponseCode(message="Conflicting response codes",
-                                                code=[code, self.repeat_code],
-                                                data=self.received_lines))
+              self.finished(
+                  InvalidResponseCode(message="Conflicting response codes",
+                                      code=[code, self.repeat_code],
+                                      data=self.received_lines))
         else:
             self.repeat_code = code
         self.received_lines.append(text)
@@ -792,15 +817,12 @@ class client(_crlfprotocol):
             self.finished(InvalidResponseCode(message="Invalid greeting",
                                               code=code, data=lines))
             return
-        self.ready(None)
+        self.hello()
         return
 
     # Once we have connected and gotten a valid greeting line, we
-    # let our controller tell us to send the EHLO/HELO sequence.
-    # The main reason for this is so that the controller can
-    # provide a domain name for us to send to the server.
-    def hello(self, name):
-        self.name = name
+    # send the EHLO/HELO sequence.
+    def hello(self):
         return self.send_command("EHLO " + name, self.ehlo_response)
 
     # We sent an EHLO, what'd we get back?
@@ -860,13 +882,15 @@ class client(_crlfprotocol):
                                  self.addr_response)
 
     def send_command(self, command, response_callback):
+        self.statfuture = asyncio.futures.Future()
         if self.state != self.READY:
-            raise InvalidState("Not ready to send a new command: " +
-                               str(self.state))
+            self.statfuture.set_exception(
+                InvalidState("Not ready to send a new command: " +
+                             str(self.state)))
+            return self.statfuture
         self.state = self.WAITING
         self.next_state = response_callback
         self.push(command)
-        self.statfuture = asyncio.futures.Future()
         return self.statfuture
 
     # This is a really simple failure check for cases where we don't
