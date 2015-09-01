@@ -1,0 +1,132 @@
+Does % escape work?
+%%
+"%"
+macro_expand
+Does % by itself fail?
+%%%
+None
+macro_expand
+Does % escape work with a larger hunk?
+%%foo
+"%foo"
+macro_expand
+Does %_ work?
+%_x
+" x"
+macro_expand
+Does %- work?
+%-x
+"%20x"
+macro_expand
+Does %{X} fail?
+%{X}
+None
+macro_expand
+Does % at the end fail?
+owjfojeofj%
+None
+macro_expand
+Does %{ fail?
+%{
+None
+macro_expand
+Does %{%s} fail?
+%{%s}
+None
+macro_expand
+Does %{s} work?
+%{s}
+"schmoe@example.com"
+macro_expand 0 schmoe@example.com
+Does %{l} work?
+%{l}
+"schmoe"
+macro_expand 0 schmoe@example.com
+Does %{o} work?
+%{o}
+"example.com"
+macro_expand 0 schmoe@example.com
+Does %{d} work?
+%{d}
+"domain.example.com"
+macro_expand 0 domain.example.com
+Does %{i} work?
+%{i}
+"10.20.30.40"
+macro_expand 10.20.30.40
+Does %{i] work on an IPv6 address?
+%{i}
+"1:2::3:4"
+macro_expand 1:2::3:4
+Does %{z} fail?
+%{z}
+None
+macro_expand
+Does %{p} succeed?
+%{p}
+None
+macro_expand
+Does %{v} succeed for IPv4?
+%{v}
+"in-addr"
+macro_expand 10.20.30.40
+Does %{v} succeed for IPv6?
+%{v}
+"ip6"
+macro_expand 1:2::3:4
+Does %{h} succeed?
+%{h}
+"unknown"
+macro_expand
+Does %{c} succeed?
+%{c}
+"10.20.30.40"
+macro_expand 10.20.30.40 0 0 True
+Does %{c} fail?
+%{c}
+None
+macro_expand 10.20.30.40 0 0 False
+Does %{r} succeed?
+%{r}
+"unknown"
+macro_expand 0 0 0 True
+Does %{r} fail?
+%{r}
+None
+macro_expand 0 0 0 False
+Does %{t} succeed?
+%{t}
+r"^[0-9]+(\.[0-9]*)?$"
+macro_expand 0 0 0 True
+Does reverse work?
+%{dr}
+com.example
+macro_expand 0 example.com
+Does truncate work?
+%{d2}
+example.com
+macro_expand 0 foo.example.com
+Does truncate work with big digits?
+%{d2222}
+foo.example.com
+macro_expand 0 foo.example.com
+Does truncate work with exact digits?
+%{d3}
+foo.example.com
+macro_expand 0 foo.example.com
+Do truncate and reverse work together?
+%{d2r}
+example.foo
+macro_expand 0 foo.example.com
+Do truncate and reverse work with explicit delimiter?
+%{d2r.}
+example.foo
+macro_expand 0 foo.example.com
+Do truncate and reverse work with multiple delimiters?
+%{d3r.+}
+example.bar.foo
+macro_expand 0 foo+bar.example.com
+Does URLencode work?
+%{S}
+joe%2Bschmoe%40example.com
+macro_expand 0 0 joe+schmoe@example.com
