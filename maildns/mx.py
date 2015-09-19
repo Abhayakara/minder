@@ -13,7 +13,7 @@ import socket
 import asyncio
 
 @asyncio.coroutine
-def get_exchanger_list(resolver, family=socket.AF_UNSPEC, lim=None, implicit=True):
+def get_exchanger_list(domain, resolver, family=socket.AF_UNSPEC, lim=None, implicit=True):
   resolver = dns.resolver.Resolver()
   resolver.use_edns(0, 0, 1410)
   mxs = {}
@@ -42,7 +42,7 @@ def get_exchanger_list(resolver, family=socket.AF_UNSPEC, lim=None, implicit=Tru
     # No answer means there's no MX record, so look for an A or
     # AAAA record.
     
-    yield from self.fetch_addrs(resolver, domain, arecs, a4recs, lim)
+    yield from fetch_addrs(resolver, domain, arecs, a4recs, lim)
     if ((arecs and len(arecs) > 0) or
         a4recs and len(a4recs) > 0):
       mxs = { 0: [ { "exchange" : domain,
@@ -74,7 +74,7 @@ def get_exchanger_list(resolver, family=socket.AF_UNSPEC, lim=None, implicit=Tru
                 addressable = True
         # Otherwise, fetch A and/or AAAA records for exchange
         if not addressable:
-          yield from self.fetch_addrs(resolver, mx.exchange, arecs, a4recs, lim)
+          yield from fetch_addrs(resolver, mx.exchange, arecs, a4recs, lim)
         if ((arecs and len(arecs) > 0) or
             a4recs and len(a4recs) > 0):
           entry = { "exchange": mx.exchange,
@@ -99,7 +99,7 @@ def get_exchanger_list(resolver, family=socket.AF_UNSPEC, lim=None, implicit=Tru
   # is not.   The interleaving is per-exchange, so we always try
   # exchanges in order of preference and, among exchanges with the
   # same preference, one exchange at a time.
-def compute_address_list(self, mxs, family, limit):
+def compute_address_list(mxs, family, limit):
   abp = []
   preferences = list(mxs.keys())
   preferences.sort()
@@ -122,20 +122,27 @@ def compute_address_list(self, mxs, family, limit):
           addrs.append((arecs[i], socket.AF_INET, name))
   return abp
 
-  # Do the A and AAAA queries in parallel.
-  @asyncio.coroutine
-  def fetch_addrs(self, resolver, name, arecs, a4recs, lim):
-    if lim and lim[0] == 0:
-      raise TooManyQueries
-    lim[0] = lim[0] - 1
-    aco = resolver.aquery(name, "A", raise_on_no_answer=False)
-    a4co = resolver.aquery(name, "AAAA", raise_on_no_answer=False)
-    co = asyncio.gather(aco, a4co)
-    (aans, a4ans) = yield from co
+# Do the A and AAAA queries in parallel.
+@asyncio.coroutine
+def fetch_addrs(resolver, name, arecs, a4recs, lim):
+  if lim and lim[0] == 0:
+    raise TooManyQueries
+  lim[0] = lim[0] - 1
+  cos = []
+  if arecs:
+    cos.append(resolver.aquery(name, "A", raise_on_no_answer=False))
+  if a4recs:
+    cos.append(resolver.aquery(name, "AAAA", raise_on_no_answer=False))
+  results = yield from asyncio.gather(*cos)
+  i = 0
+  if arecs:
+    aans = results[0]
+    i = i + 1
     if aans.rrset != None:
       for rdata in aans:
         arecs.append(rdata.address)
+  if a4recs:
+    a4ans = results[i]
     if a4ans.rrset != None:
       for rdata in a4ans:
         a4recs.append(rdata.address)
-    
